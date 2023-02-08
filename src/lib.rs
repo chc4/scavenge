@@ -31,6 +31,18 @@ pub struct Token<'life, T, COMPACT> {
     _phantom: PhantomData<Id<'life>>,
     _compact: PhantomData<COMPACT>,
 }
+
+impl<'life, T, COMPACT> Drop for Token<'life, T, COMPACT> {
+    fn drop(&mut self) {
+        // It's safe to just drop a Token. It will consume space via Arena bitmap,
+        // but only until the next compaction cycle. We can also run Drop for the
+        // item, due to COMPACT guaranteeing we are either being dropped before
+        // the guard goes out of scope, or are leaked (in which case Drop is never ran).
+        let data: &mut T = unsafe { core::mem::transmute(self.ptr) };
+        drop(data);
+    }
+}
+
 impl<'a, 'life, 'compact, T: 'a, const SIZE: usize> FnOnce<(&'a Arena<'life, SIZE>,)> for Token<'life, T, &Guard<'compact>> {
     type Output = Item<'life, &'a mut T>;
 
@@ -236,7 +248,7 @@ mod tests {
         make_guard!(compact);
         let mut tok_v = v.drain(..).map(|i| arena.tokenize(&compact, i) ).collect::<Vec<_>>();
         let state = arena.compact(&compact, state);
-        let v = tok_v.drain(..).map(|t| t(&arena) ).collect::<Vec<_>>();
+        let v = tok_v.into_iter().map(|t| t(&arena) ).collect::<Vec<_>>();
         arena.finish(compact, state);
         for i in 0..10 {
             assert_eq!(*v[i], i as u8);
@@ -257,7 +269,7 @@ mod tests {
         make_guard!(compact);
         let mut tok_v = v.drain(5..10).map(|i| arena.tokenize(&compact, i) ).collect::<Vec<_>>();
         let state = arena.compact(&compact, state);
-        let v = tok_v.drain(..).map(|t| t(&arena) ).collect::<Vec<_>>();
+        let v = tok_v.into_iter().map(|t| t(&arena) ).collect::<Vec<_>>();
         arena.finish(compact, state);
         for i in 0..5 {
             assert_eq!(*v[i], 5+i as u8);
@@ -333,6 +345,22 @@ mod tests {
         arena.finish(compact, state);
         assert_eq!(*a, [0x1,0x2]);
         assert_eq!(*b, [0x3,0x4]);
+        Ok(())
+    }
+
+    #[test]
+    fn tokenizing_leak_token() -> Result<(), Box<dyn std::error::Error>> {
+        make_guard!(guard);
+        let (mut arena, state): (Arena<'_, 1024>, _) = Arena::new(guard);
+        let mut a = arena.allocate::<[u8;2]>(&state)?;
+        *a = [0x1,0x2];
+
+        make_guard!(compact);
+        let tok_a = arena.tokenize(&compact, a);
+        let state = arena.compact(&compact, state);
+        let a = Box::leak(Box::new(tok_a));
+        arena.finish(compact, state);
+        //assert_eq!(*(a(&arena)), [0x1,0x2]);
         Ok(())
     }
 }
