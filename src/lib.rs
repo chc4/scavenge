@@ -33,14 +33,17 @@ struct Item<'life, T> {
     _phantom: PhantomData<Id<'life>>,
 }
 
-struct Token<'life, T> {
+struct Token<'life, T, COMPACT> {
     ptr: *mut T,
     _phantom: PhantomData<Id<'life>>,
+    _compact: PhantomData<COMPACT>,
 }
-impl<'a, 'life, T: 'a, const SIZE: usize> FnOnce<(&'a Arena<'life, SIZE>,)> for Token<'life, T> {
+impl<'a, 'life, 'compact, T: 'a, const SIZE: usize> FnOnce<(&'a Arena<'life, SIZE>,)> for Token<'life, T, &Guard<'compact>> {
     type Output = Item<'life, &'a mut T>;
 
     extern "rust-call" fn call_once(self, arena: (&'a Arena<'life, SIZE>,)) -> Self::Output {
+        // SAFETY: The token is branded with a 'life ID, which must match the Arena
+        // that it is paired with in order to call this and redeem the token.
         let data = unsafe { core::mem::transmute(self.ptr) };
         Item { data, _phantom: PhantomData }
     }
@@ -79,16 +82,24 @@ impl<'life, 'a, T: 'life, const SIZE: usize> core::ops::DerefMut for ForwardTemp
     }
 }
 
-impl<'a, 'life, T> Item<'life, &'a mut T> {
+impl<'a, 'life, 'compact, T> Item<'life, &'a mut T> {
     /// Tokenize an allocated item into a forwarding pointer, which removes the
     /// tie to the Arena lifetime until redeemed again.
     ///
     /// The tokens use a "lifetime two phase commit" mechanism to make sure that
-    /// all tokenized items forwarding pointers are resolved at once, which
-    /// allows the compaction to happen all at once without needing to reserve a
-    /// forwarding pointer side table.
-    pub fn tokenize(self) -> Token<'life, T> {
-        Token { ptr: self.data as *mut T, _phantom: PhantomData }
+    /// 1) there are no outstanding direct Item references when compacting starts, only Tokens
+    /// 2) there are no outstanding Tokens when compacting ends, only Items
+    ///
+    /// let a = arena.create(0xaabb); // Item<'life, 'a>
+    /// make_guard!(compacting);
+    /// let tok_a = a.tokenize(&compacting); // Token<'life, 'compacting>
+    /// // errors if any outstanding 'a lifetimes
+    /// arena.start_compacting();
+    /// let new_a = tok_a(&area); // Item<'life, 'b>
+    /// // errors if any outstanding 'compacting lifetimes
+    /// arena.finish_compacting(&mut compacting);
+    pub fn tokenize<'fresh>(self, guard: &'fresh Guard<'compact>) -> Token<'life, T, &'fresh Guard<'compact>> {
+        Token { ptr: self.data as *mut T, _phantom: PhantomData, _compact: PhantomData }
     }
 }
 
@@ -98,8 +109,12 @@ impl<'a, 'life, T: 'life> Item<'life, &'a mut WithHeader<T>> {
     ///
     /// The forwarding pointer wrapper in wrapped in a Pin<T>, because the arena
     /// must keep track of the pointer to update when compacting; likewise, the
-    /// item must be a WithHeader<T> so that it is has space allocated from that
-    /// tracking pointer.
+    /// item must be a WithHeader<T> so that it is has space allocated for that
+    /// bookkeeping.
+    ///
+    /// This necessitates that future uses of the forwarding pointer require a
+    /// double-deref in order to reach the item, and that they cause an extra
+    /// heap allocation.
     pub fn forwarding<const SIZE: usize>(mut self, arena: &'a Arena<'life, SIZE>) -> Pin<Box<Forward<'life, T>>> {
         let ptr = &mut self.data.item as *mut T as *mut u8;
 
@@ -154,10 +169,10 @@ impl<'life, const SIZE: usize> Arena<'life, SIZE> {
         }
     }
 
-    fn compact(&mut self) {
-    }
-}
+    fn compact<'compact>(&mut self) { }
 
+    fn finish<'compact>(&self, guard: Guard<'compact>) { }
+}
 
 #[cfg(test)]
 mod tests {
@@ -172,10 +187,55 @@ mod tests {
         assert_eq!(*a, 0);
         *a = 1;
         assert_eq!(a2[0], 0);
-        let a_tok = a.tokenize();
+        make_guard!(compact);
+        let a_tok = a.tokenize(&compact);
         arena.compact();
         let a = a_tok(&arena);
+        let arena = arena.finish(compact);
         assert_eq!(*a, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn tokenizing_fail() -> Result<(), Box<dyn std::error::Error>> {
+        make_guard!(guard);
+        let mut arena: Arena<'_, 1024> = Arena::new(guard);
+        let mut a = arena.allocate::<u8>()?;
+        let mut a2 = arena.allocate::<[u32;12]>()?;
+        assert_eq!(*a, 0);
+        *a = 1;
+        assert_eq!(a2[0], 0);
+
+        make_guard!(compact);
+        let a_tok = a.tokenize(&compact);
+        let a2_tok = a2.tokenize(&compact);
+        arena.compact();
+        let a = a_tok(&arena);
+        arena.finish(compact);
+        //let a2 = a2_tok(&arena);
+        assert_eq!(*a, 1);
+        Ok(())
+    }
+
+
+    #[test]
+    fn tokenizing_vec() -> Result<(), Box<dyn std::error::Error>> {
+        make_guard!(guard);
+        let mut arena: Arena<'_, 1024> = Arena::new(guard);
+        let mut v = vec![];
+        for i in 0..10 {
+            let mut item = arena.allocate::<u8>()?;
+            *item = i;
+            v.push(item);
+        }
+        make_guard!(compact);
+        let mut tok_v = v.drain(..).map(|i| i.tokenize(&compact) ).collect::<Vec<_>>();
+        arena.compact();
+        let v = tok_v.drain(..).map(|t| t(&arena) ).collect::<Vec<_>>();
+        arena.finish(compact);
+        for i in 0..10 {
+            assert_eq!(*v[i], i as u8);
+        }
         Ok(())
     }
 
@@ -188,7 +248,9 @@ mod tests {
         assert_eq!(*forwarding_a, 0);
         *forwarding_a = 1;
         assert_eq!(*forwarding_a, 1);
+        make_guard!(compact);
         arena.compact();
+        arena.finish(compact);
         assert_eq!(*a.with(&arena), 1);
         Ok(())
     }
