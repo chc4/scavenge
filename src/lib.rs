@@ -46,6 +46,11 @@ impl<'a, 'life, 'compact, T: 'a, const SIZE: usize> FnOnce<(&'a Arena<'life, SIZ
         let mut data = self.ptr;
         if data as usize > arena.0.bytes.as_ptr() as usize + arena.0.current.borrow().size() {
             println!("moving {:?}", self.ptr);
+            // mark our *own* allocation as free, so that e.g. [A][B][C] can
+            // become [A][C][free] if sizeof(B)<sizeof(C).
+            let off = data as usize - arena.0.bytes.as_ptr() as usize;
+            arena.0.bitmap.borrow_mut().insert_range(off as u32..(off+core::mem::size_of::<T>()) as u32);
+            println!("{:?}", arena.0.bitmap.borrow());
             // this unwrap shouldn't ever fail, since our memory usage usually shouldn't (can't?)
             // *increase* during a compaction
             let new_loc = loop {
@@ -305,4 +310,29 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn tokenizing_small_gap() -> Result<(), Box<dyn std::error::Error>> {
+        make_guard!(guard);
+        let (mut arena, state): (Arena<'_, 1024>, _) = Arena::new(guard);
+        let mut first = arena.allocate::<u8>(&state)?;
+        *first = 0xCC;
+        let mut a = arena.allocate::<[u8;2]>(&state)?;
+        *a = [0x1,0x2];
+        let mut b = arena.allocate::<[u8;2]>(&state)?;
+        *b = [0x3,0x4];
+
+        make_guard!(compact);
+        let tok_a = arena.tokenize(&compact, a);
+        let tok_b = arena.tokenize(&compact, b);
+        let state = arena.compact(&compact, state);
+        // this doesn't actually compact correctly: if you don't redeem
+        // tokens in ascending ordering, than they can't all reclaimed free space.
+        // this wouldn't be a problem if Arena was a fixed-size type arena, so. idk
+        let b = tok_b(&arena);
+        let a = tok_a(&arena);
+        arena.finish(compact, state);
+        assert_eq!(*a, [0x1,0x2]);
+        assert_eq!(*b, [0x3,0x4]);
+        Ok(())
+    }
 }
