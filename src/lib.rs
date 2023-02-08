@@ -1,6 +1,6 @@
 #![feature(unboxed_closures, fn_traits, inline_const, ptr_sub_ptr, pin_macro)]
 use generativity::{make_guard, Guard, Id};
-use stack_tokens::{stack_token, RefCellLocalKeyExt};
+use roaring::{RoaringBitmap};
 use core::sync::atomic::{Ordering, AtomicUsize};
 use std::alloc::Layout;
 use core::cell::RefCell;
@@ -11,28 +11,17 @@ use std::ops::{Deref, DerefMut};
 struct Arena<'life, const SIZE: usize> {
     current: RefCell<Layout>,
     bytes: Box<[u8; SIZE]>,
-    // The actual unmovable forwarding pointer references
-    forwarding: RefCell<Vec<*const ()>>,
+    bitmap: RefCell<RoaringBitmap>,
     _token: PhantomData<Id<'life>>,
 }
 
-#[repr(C)]
-struct WithHeader<T> {
-    forwarding: *const *const (),
-    item: T,
-}
-
-impl<T: Default> Default for WithHeader<T> {
-    fn default() -> Self {
-        Self { forwarding: 0 as *const *const (), item: Default::default() }
-    }
-}
-
+#[repr(transparent)]
 struct Item<'life, T> {
     data: T,
     _phantom: PhantomData<Id<'life>>,
 }
 
+#[repr(transparent)]
 struct Token<'life, T, COMPACT> {
     ptr: *mut T,
     _phantom: PhantomData<Id<'life>>,
@@ -42,6 +31,13 @@ impl<'a, 'life, 'compact, T: 'a + Copy, const SIZE: usize> FnOnce<(&'a Arena<'li
     type Output = Item<'life, &'a mut T>;
 
     extern "rust-call" fn call_once(self, arena: (&'a Arena<'life, SIZE>,)) -> Self::Output {
+        // XXX: THIS IS WRONG. tokens can be redeemed out of order, which means
+        // that you can have a token at 0 and then redeem 1, overwriting the first
+        // live object. we need to mark a bitmap on tokenizing for the bounds of
+        // memory, and then skip marked tokenized memory when reserving; then, when
+        // we redeem the tokens, if self.ptr is less than arena.current, we don't
+        // have to move it at all because it's already inside the compacted region.
+
         // This token is being redeemed, meaning it's an alive object; we move the
         // object to the end of the compacted region.
         //
@@ -49,99 +45,37 @@ impl<'a, 'life, 'compact, T: 'a + Copy, const SIZE: usize> FnOnce<(&'a Arena<'li
         // that it is paired with in order to call this and redeem the token.
         // Likewise, the token has a borrow for a Guard token for the compaction step,
         // and thus can't be redeemed after compacting has finished.
-        let data: &mut T = unsafe { core::mem::transmute(self.ptr) };
-        // this unwrap shouldn't ever fail, since our memory usage usually shouldn't (can't?)
-        // *increase* during a compaction
-        let new_loc = arena.0.reserve::<T>().unwrap();
-        unsafe {
-            core::ptr::write(new_loc, *data);
+        let mut data: &mut T = unsafe { core::mem::transmute(self.ptr) };
+        // only reallocate if the item isn't already in the compacted region
+        if data as *mut _ as usize > arena.0.bytes.as_ptr() as usize + arena.0.current.borrow().size() + 1 {
+            println!("moving {:?}", self.ptr);
+            // this unwrap shouldn't ever fail, since our memory usage usually shouldn't (can't?)
+            // *increase* during a compaction
+            let new_loc = loop {
+                let start: u32 = arena.0.current.borrow().size().try_into().unwrap();
+                let new_loc = arena.0.reserve::<T>().unwrap();
+                let end: u32 = arena.0.current.borrow().size().try_into().unwrap();
+                // the bitmap is the available *holes*, not alive values, thanks
+                // to Arena::compact(). if we're able to clear the entire region,
+                // then it was free and we can allocate into it.
+                if arena.0.bitmap.borrow_mut().remove_range(start..end) == (start..end).len() as u64 {
+                    break new_loc
+                }
+                // else jump to the next free space
+                *arena.0.current.borrow_mut() = Layout::from_size_align(
+                    arena.0.bitmap.borrow().min().unwrap() as usize, 1).unwrap();
+            };
+            unsafe {
+                core::ptr::write(new_loc, *data);
+                data = core::mem::transmute(new_loc);
+            }
         }
         Item { data, _phantom: PhantomData }
     }
 }
 
-struct Forward<'life, T> {
-    ptr: *mut T,
-    _life: PhantomData<Id<'life>>,
-    _item: PhantomData<*mut T>,
-}
-
-impl<'life, T> Forward<'life, T> {
-    pub fn with<'a, const SIZE: usize>(&'a self, arena: &'a Arena<'life, SIZE>) -> ForwardTemp<'life, 'a, T, SIZE> {
-        ForwardTemp { forwarding: self, arena }
-    }
-}
-
-struct ForwardTemp<'life, 'a, T, const SIZE: usize> {
-    forwarding: &'a Forward<'life, T>,
-    arena: &'a Arena<'life, SIZE>,
-}
-
-impl<'life, 'a, T: 'life, const SIZE: usize> core::ops::Deref for ForwardTemp<'life, 'a, T, SIZE> {
-    type Target = T;
-    fn deref(&self) -> &'a Self::Target {
-        unsafe {
-            core::mem::transmute(self.forwarding.ptr)
-        }
-    }
-}
-impl<'life, 'a, T: 'life, const SIZE: usize> core::ops::DerefMut for ForwardTemp<'life, 'a, T, SIZE> {
-    fn deref_mut(&mut self) -> &mut <Self as core::ops::Deref>::Target {
-        unsafe {
-            core::mem::transmute(self.forwarding.ptr)
-        }
-    }
-}
-
 impl<'a, 'life, 'compact, T> Item<'life, &'a mut T> {
-    /// Tokenize an allocated item into a forwarding pointer, which removes the
-    /// tie to the Arena lifetime until redeemed again.
-    ///
-    /// The tokens use a "lifetime two phase commit" mechanism to make sure that
-    /// 1) there are no outstanding direct Item references when compacting starts, only Tokens
-    /// 2) there are no outstanding Tokens when compacting ends, only Items
-    ///
-    /// let a = arena.create(0xaabb); // Item<'life, 'a>
-    /// make_guard!(compacting);
-    /// let tok_a = a.tokenize(&compacting); // Token<'life, 'compacting>
-    /// // errors if any outstanding 'a lifetimes
-    /// arena.start_compacting();
-    /// let new_a = tok_a(&area); // Item<'life, 'b>
-    /// // errors if any outstanding 'compacting lifetimes
-    /// arena.finish_compacting(&mut compacting);
-    pub fn tokenize<'fresh>(self, guard: &'fresh Guard<'compact>) -> Token<'life, T, &'fresh Guard<'compact>> {
-        Token { ptr: self.data as *mut T, _phantom: PhantomData, _compact: PhantomData }
-    }
 }
-
-//impl<'a, 'life, T: 'life> Item<'life, &'a mut WithHeader<T>> {
-//    /// Convert an Item into a reference that does a forwarding pointer chase on
-//    /// every deref, and instead restricts the deref borrow.
-//    ///
-//    /// The forwarding pointer wrapper in wrapped in a Pin<T>, because the arena
-//    /// must keep track of the pointer to update when compacting; likewise, the
-//    /// item must be a WithHeader<T> so that it is has space allocated for that
-//    /// bookkeeping.
-//    ///
-//    /// This necessitates that future uses of the forwarding pointer require a
-//    /// double-deref in order to reach the item, and that they cause an extra
-//    /// heap allocation.
-//    pub fn forwarding<const SIZE: usize>(mut self, arena: &'a Arena<'life, SIZE>) -> Pin<Box<Forward<'life, T>>> {
-//        let ptr = &mut self.data.item as *mut T as *mut u8;
-//
-//        // create the pinned pointer to the forwarding pointer
-//        let pin = Box::pin(Forward {
-//            ptr: ptr as *mut _,
-//            _item: PhantomData,
-//            _life: PhantomData,
-//        });
-//
-//        // calculate the address of where the forwarding pointer will be and set
-//        // it in the item's header
-//        self.deref_mut().forwarding = pin.deref().ptr as *const _;
-//        pin
-//    }
-//}
 
 impl<'life, T: 'life> core::ops::Deref for Item<'life, &mut T> {
     type Target = T;
@@ -157,11 +91,10 @@ impl<'life, T: 'life> core::ops::DerefMut for Item<'life, &mut T> {
 
 impl<'life, const SIZE: usize> Arena<'life, SIZE> {
     fn new<'a>(id: Guard<'a>) -> (Arena<'a, SIZE>, Allocating<'a>) {
-        let forwarding = vec![];
         (Arena {
             current: RefCell::new(Layout::from_size_align(0, 1).unwrap()),
             bytes: Box::new([0; SIZE]),
-            forwarding: RefCell::new(forwarding),
+            bitmap: RefCell::new(RoaringBitmap::new()),
             _token: Default::default(),
         }, Allocating(id.into()))
     }
@@ -186,19 +119,65 @@ impl<'life, const SIZE: usize> Arena<'life, SIZE> {
         }
     }
 
+    /// Tokenize an allocated item into a forwarding pointer, which removes the
+    /// tie to the Arena lifetime until redeemed again.
+    ///
+    /// The tokens use a "lifetime two phase commit" mechanism to make sure that
+    /// 1) there are no outstanding direct Item references when compacting starts, only Tokens
+    /// 2) there are no outstanding Tokens when compacting ends, only Items
+    ///
+    /// Objects are marked as live when they are tokenized, not when they are redeemed.
+    /// This means that if you are compacting memory and create tokens for a set
+    /// of objects, but only redeem half of them and drop the rest, the memory
+    /// for the unredeemed half will not be reclaimed (until the next compaction set).
+    pub fn tokenize<'a, 'compact, 'fresh, T>(&self, guard: &'fresh Guard<'compact>, item: Item<'life, &'a mut T>) -> Token<'life, T, &'fresh Guard<'compact>> {
+        // Mark the item's region as used
+        let ptr = (item.data as *mut T as usize) - self.bytes.as_ptr() as usize;
+        let ptr_trunc: u32 = ptr.try_into().unwrap();
+        println!("marking {}..={} as alive", ptr_trunc, ptr_trunc+(core::mem::size_of::<T>() as u32));
+        self.bitmap.borrow_mut().insert_range(ptr_trunc..ptr_trunc+(core::mem::size_of::<T>() as u32));
+        Token { ptr: item.data as *mut T, _phantom: PhantomData, _compact: PhantomData }
+    }
+
+
     fn compact<'compact>(&mut self, guard: &Guard<'compact>, compact: Allocating<'life>) -> Compacting<'compact, 'life> {
-        // reset the bump pointer; all the objects that are alive will be redeemed
-        // via tokens, which will re-allocate the object.
-        //
+        // now we've started compaction, and it's impossible to any more values to
+        // tokenize themselves and mark themselves alive.
+
+        let top = self.bitmap.borrow().max().unwrap_or(0) as usize;
+
+        // create the inverse of our alive bitmap; this lets us quickly find empty
+        // regions.
+        let mut full = RoaringBitmap::new();
+        full.insert_range(0..=<usize as TryInto<u32>>::try_into(top + 1).unwrap());
+        use std::ops::BitXor;
+        let alive = self.bitmap.borrow();
+        let dif = full.bitxor(&*alive);
+        println!("dif {:?}", dif);
+        // advance the bump pointer to the first free byte in the region
+        *self.current.borrow_mut() = Layout::from_size_align(dif.min().unwrap_or(0) as usize, 1).unwrap();
+
+        // set out bitmap to the inverted one
+        drop(alive);
+        *self.bitmap.borrow_mut() = dif;
+
         // we can't have Arena itself be a linear state transitioning type, and have
         // to use a seperate parameter. this is because although we could move self
-        // in this, we can't move it in the corrosponding finish() call, due to
+        // in this, we can't move it again in the corrosponding finish() call, due to
         // token redeeming having to re-borrow the Item with the new lifetime after
         // compacting.
         Compacting(compact.0, PhantomData)
     }
 
     fn finish<'compact>(&self, guard: Guard<'compact>, allocatable: Compacting<'compact, 'life>) -> Allocating<'life> {
+        // we're finished compacting, since there's now no way for any tokens to be
+        // redeemed now that we've consumed the guard. we can now blow away the
+        // marked metadata bits for the next collection cycle.
+        // it's possible there were some tokens that were created but not redeemed,
+        // in which case there's no way for their bits to be set by tokenizing
+        // again *next* cycle, guaranteeing no leaked objects can survive two
+        // compactions.
+        self.bitmap.borrow_mut().clear();
         Allocating(allocatable.0)
     }
 }
@@ -220,7 +199,7 @@ mod tests {
         *a = 1;
         assert_eq!(a2[0], 0);
         make_guard!(compact);
-        let a_tok = a.tokenize(&compact);
+        let a_tok = arena.tokenize(&compact, a);
         let state = arena.compact(&compact, state);
         let a = a_tok(&arena);
         let state = arena.finish(compact, state);
@@ -239,7 +218,7 @@ mod tests {
             v.push(item);
         }
         make_guard!(compact);
-        let mut tok_v = v.drain(..).map(|i| i.tokenize(&compact) ).collect::<Vec<_>>();
+        let mut tok_v = v.drain(..).map(|i| arena.tokenize(&compact, i) ).collect::<Vec<_>>();
         let state = arena.compact(&compact, state);
         let v = tok_v.drain(..).map(|t| t(&arena) ).collect::<Vec<_>>();
         arena.finish(compact, state);
@@ -260,7 +239,7 @@ mod tests {
             v.push(item);
         }
         make_guard!(compact);
-        let mut tok_v = v.drain(5..10).map(|i| i.tokenize(&compact) ).collect::<Vec<_>>();
+        let mut tok_v = v.drain(5..10).map(|i| arena.tokenize(&compact, i) ).collect::<Vec<_>>();
         let state = arena.compact(&compact, state);
         let v = tok_v.drain(..).map(|t| t(&arena) ).collect::<Vec<_>>();
         arena.finish(compact, state);
@@ -270,20 +249,49 @@ mod tests {
         Ok(())
     }
 
-    //#[test]
-    //fn forwarding() -> Result<(), Box<dyn std::error::Error>> {
-    //    make_guard!(guard);
-    //    let mut arena: Arena<'_, 1024> = Arena::new(guard);
-    //    let mut a = arena.allocate::<WithHeader<u8>>()?.forwarding(&arena);
-    //    let mut forwarding_a = a.with(&arena);
-    //    assert_eq!(*forwarding_a, 0);
-    //    *forwarding_a = 1;
-    //    assert_eq!(*forwarding_a, 1);
-    //    make_guard!(compact);
-    //    let arena = arena.compact();
-    //    arena.finish(compact);
-    //    assert_eq!(*a.with(&arena), 1);
-    //    Ok(())
-    //}
+    #[test]
+    fn tokenizing_vec_out_of_order() -> Result<(), Box<dyn std::error::Error>> {
+        make_guard!(guard);
+        let (mut arena, state): (Arena<'_, 1024>, _) = Arena::new(guard);
+        let mut a = arena.allocate::<u8>()?;
+        *a = 0xAA;
+        let mut b = arena.allocate::<u8>()?;
+        *b = 0xBB;
+
+        make_guard!(compact);
+        let tok_a = arena.tokenize(&compact, a);
+        let tok_b = arena.tokenize(&compact, b);
+        let state = arena.compact(&compact, state);
+        // redeem in the opposite order
+        let b = tok_b(&arena);
+        let a = tok_a(&arena);
+        arena.finish(compact, state);
+        assert_eq!(*a, 0xAA);
+        assert_eq!(*b, 0xBB);
+        Ok(())
+    }
+
+    #[test]
+    fn tokenizing_vec_out_of_order_with_compacting() -> Result<(), Box<dyn std::error::Error>> {
+        make_guard!(guard);
+        let (mut arena, state): (Arena<'_, 1024>, _) = Arena::new(guard);
+        let mut first = arena.allocate::<u8>()?;
+        let mut a = arena.allocate::<u8>()?;
+        *a = 0xAA;
+        let mut b = arena.allocate::<u8>()?;
+        *b = 0xBB;
+
+        make_guard!(compact);
+        let tok_a = arena.tokenize(&compact, a);
+        let tok_b = arena.tokenize(&compact, b);
+        let state = arena.compact(&compact, state);
+        // redeem in the opposite order
+        let b = tok_b(&arena);
+        let a = tok_a(&arena);
+        arena.finish(compact, state);
+        assert_eq!(*a, 0xAA);
+        assert_eq!(*b, 0xBB);
+        Ok(())
+    }
 
 }
