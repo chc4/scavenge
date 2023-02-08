@@ -53,7 +53,7 @@ impl<'life, T: 'life> core::ops::DerefMut for Item<'life, &mut T> {
 impl<'life, const SIZE: usize> Arena<'life, SIZE> {
     fn new<'a>(id: Guard<'a>) -> Arena<'a, SIZE> {
         Arena {
-            current: RefCell::new(Layout::from_size_align(0, 16).unwrap()),
+            current: RefCell::new(Layout::from_size_align(0, 1).unwrap()),
             bytes: Box::new([0; SIZE]),
             _token: Default::default(),
         }
@@ -61,12 +61,13 @@ impl<'life, const SIZE: usize> Arena<'life, SIZE> {
 
     fn allocate<'a, T: Default>(&'a self) -> Result<Item<'life, &'a mut T>, Box<dyn std::error::Error>> {
         let start = self.current.borrow().clone();
-        start.extend(Layout::new::<T>())?;
-        let end = start.pad_to_align();
+        let (end, next) = start.extend(Layout::new::<T>())?;
+        let end = end.pad_to_align();
         *self.current.borrow_mut() = end;
+        println!("item at {}, next at {}", next, end.size());
         unsafe {
             let item = core::mem::transmute::<*mut T, &'a mut T>(
-                (self.bytes.as_ptr() as *const u8).add(end.size()) as *mut T);
+                (self.bytes.as_ptr() as *const u8).add(next) as *mut T);
             *item = Default::default();
             Ok(Item { data: item, _phantom: PhantomData })
         }
@@ -86,11 +87,13 @@ mod tests {
         make_guard!(guard);
         let mut arena: Arena<'_, 1024> = Arena::new(guard);
         let mut a = arena.allocate::<u8>()?;
+        let mut a2 = arena.allocate::<[u32;12]>()?;
         assert_eq!(*a, 0);
         *a = 1;
-        //let a_tok = a.tokenize();
+        assert_eq!(a2[0], 0);
+        let a_tok = a.tokenize();
         arena.compact();
-        //let a = a_tok(&arena);
+        let a = a_tok(&arena);
         assert_eq!(*a, 1);
         Ok(())
     }
