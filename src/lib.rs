@@ -47,7 +47,7 @@ impl<'a, 'life, 'compact, T: 'a + Copy, const SIZE: usize> FnOnce<(&'a Arena<'li
         // and thus can't be redeemed after compacting has finished.
         let mut data: &mut T = unsafe { core::mem::transmute(self.ptr) };
         // only reallocate if the item isn't already in the compacted region
-        if data as *mut _ as usize > arena.0.bytes.as_ptr() as usize + arena.0.current.borrow().size() + 1 {
+        if data as *mut _ as usize > arena.0.bytes.as_ptr() as usize + arena.0.current.borrow().size() {
             println!("moving {:?}", self.ptr);
             // this unwrap shouldn't ever fail, since our memory usage usually shouldn't (can't?)
             // *increase* during a compaction
