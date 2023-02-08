@@ -31,7 +31,7 @@ pub struct Token<'life, T, COMPACT> {
     _phantom: PhantomData<Id<'life>>,
     _compact: PhantomData<COMPACT>,
 }
-impl<'a, 'life, 'compact, T: 'a + Copy, const SIZE: usize> FnOnce<(&'a Arena<'life, SIZE>,)> for Token<'life, T, &Guard<'compact>> {
+impl<'a, 'life, 'compact, T: 'a, const SIZE: usize> FnOnce<(&'a Arena<'life, SIZE>,)> for Token<'life, T, &Guard<'compact>> {
     type Output = Item<'life, &'a mut T>;
 
     extern "rust-call" fn call_once(self, arena: (&'a Arena<'life, SIZE>,)) -> Self::Output {
@@ -63,7 +63,7 @@ impl<'a, 'life, 'compact, T: 'a + Copy, const SIZE: usize> FnOnce<(&'a Arena<'li
                     arena.0.bitmap.borrow().min().unwrap() as usize, 1).unwrap();
             };
             unsafe {
-                core::ptr::write(new_loc, *data);
+                core::ptr::copy(data, new_loc, core::mem::size_of::<T>());
                 data = new_loc;
             }
         }
@@ -261,7 +261,7 @@ mod tests {
     }
 
     #[test]
-    fn tokenizing_vec_out_of_order() -> Result<(), Box<dyn std::error::Error>> {
+    fn tokenizing_out_of_order() -> Result<(), Box<dyn std::error::Error>> {
         make_guard!(guard);
         let (mut arena, state): (Arena<'_, 1024>, _) = Arena::new(guard);
         let mut a = arena.allocate::<u8>(&state)?;
@@ -283,7 +283,7 @@ mod tests {
     }
 
     #[test]
-    fn tokenizing_vec_out_of_order_with_compacting() -> Result<(), Box<dyn std::error::Error>> {
+    fn tokenizing_out_of_order_with_compacting() -> Result<(), Box<dyn std::error::Error>> {
         make_guard!(guard);
         let (mut arena, state): (Arena<'_, 1024>, _) = Arena::new(guard);
         let mut first = arena.allocate::<u8>(&state)?;
