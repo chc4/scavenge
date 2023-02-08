@@ -63,7 +63,7 @@ impl<'a, 'life, 'compact, T: 'a, const SIZE: usize> FnOnce<(&'a Arena<'life, SIZ
                     arena.0.bitmap.borrow().min().unwrap() as usize, 1).unwrap();
             };
             unsafe {
-                core::ptr::copy(data, new_loc, core::mem::size_of::<T>());
+                core::ptr::copy(data, new_loc, 1);
                 data = new_loc;
             }
         }
