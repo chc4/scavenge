@@ -70,7 +70,7 @@ impl<'a, 'life, 'compact, T: 'a, const SIZE: usize> FnOnce<(&'a Arena<'life, SIZ
         // and thus can't be redeemed after compacting has finished.
         // only reallocate if the item isn't already in the compact region
         let Token { ptr: mut data , .. } = self;
-        if data as usize > arena.0.bytes as usize + arena.0.current.borrow().size() {
+        if data as usize > arena.0.current.borrow().size() {
             println!("moving {:?}", self.ptr);
             // mark our *own* allocation as free, so that e.g. [A][B][C] can
             // become [A][C][free] if sizeof(B)<sizeof(C).
@@ -80,9 +80,9 @@ impl<'a, 'life, 'compact, T: 'a, const SIZE: usize> FnOnce<(&'a Arena<'life, SIZ
             // this unwrap shouldn't ever fail, since our memory usage usually shouldn't (can't?)
             // *increase* during a compaction
             let new_loc = loop {
-                let start: u32 = arena.0.current.borrow().size().try_into().unwrap();
+                let start: u32 = (arena.0.current.borrow().size() as usize - arena.0.bytes as usize).try_into().unwrap();
                 let new_loc = arena.0.reserve::<T>().unwrap();
-                let end: u32 = arena.0.current.borrow().size().try_into().unwrap();
+                let end: u32 = (arena.0.current.borrow().size() as usize - arena.0.bytes as usize).try_into().unwrap();
                 // the bitmap is the available *holes*, not alive values, thanks
                 // to Arena::compact(). if we're able to clear the entire region,
                 // then it was free and we can allocate into it.
@@ -91,7 +91,7 @@ impl<'a, 'life, 'compact, T: 'a, const SIZE: usize> FnOnce<(&'a Arena<'life, SIZ
                 }
                 // else jump to the next free space
                 *arena.0.current.borrow_mut() = Layout::from_size_align(
-                    arena.0.bitmap.borrow().min().unwrap() as usize, 1).unwrap();
+                    arena.0.bytes as usize + arena.0.bitmap.borrow().min().unwrap() as usize, 1).unwrap();
             };
             unsafe {
                 core::ptr::copy(data, new_loc, 1);
@@ -118,9 +118,10 @@ impl<'life, T: 'life> core::ops::DerefMut for Item<'life, &mut T> {
 
 impl<'life, const SIZE: usize> Arena<'life, SIZE> {
     pub fn new<'a>(id: Guard<'a>) -> (Arena<'a, SIZE>, Allocating<'a>) {
+        let bytes = Box::into_raw(Box::new([0; SIZE]));
         (Arena {
-            current: RefCell::new(Layout::from_size_align(0, 1).unwrap()),
-            bytes: Box::into_raw(Box::new([0; SIZE])),
+            current: RefCell::new(Layout::from_size_align(bytes as usize, 1).unwrap()),
+            bytes,
             bitmap: RefCell::new(RoaringBitmap::new()),
             _token: Default::default(),
         }, Allocating(id.into()))
@@ -128,19 +129,18 @@ impl<'life, const SIZE: usize> Arena<'life, SIZE> {
 
     fn reserve<'a, T>(&'a self) -> Result<*mut T, Box<dyn std::error::Error>> {
         let start = self.current.borrow().clone();
-        let new_start = start.align_to(core::mem::align_of::<T>())?;
-        let (end, next) = new_start.extend(Layout::new::<T>())?;
-        let end = end.pad_to_align();
+        let (end, next) = start.extend(Layout::new::<T>())?;
         *self.current.borrow_mut() = end;
-        println!("item at {}, next at {}", next, end.size());
+        println!("item at {}, next at {}", next - self.bytes as usize, end.size() - self.bytes as usize);
         unsafe {
-            Ok((self.bytes as *mut u8).add(next) as *mut T)
+            Ok((self.bytes as *mut u8).add(next - self.bytes as usize) as *mut T)
         }
     }
 
     pub fn allocate<'a, T: Default>(&'a self, allocating: &Allocating<'life>) -> Result<Item<'life, &'a mut T>, Box<dyn std::error::Error>> {
         let item = self.reserve::<T>()?;
         unsafe {
+            println!("{:x} {}", item as usize, core::mem::align_of::<T>());
             core::ptr::write(item, Default::default());
             let item = core::mem::transmute::<*mut T, &'a mut T>(item);
             Ok(Item { data: item, _phantom: PhantomData })
@@ -191,7 +191,8 @@ impl<'life, const SIZE: usize> Arena<'life, SIZE> {
         let dif = full.bitxor(&*alive);
         println!("dif {:?}", dif);
         // advance the bump pointer to the first free byte in the region
-        *self.current.borrow_mut() = Layout::from_size_align(dif.min().unwrap_or(0) as usize, 1).unwrap();
+        *self.current.borrow_mut() = Layout::from_size_align(
+            self.bytes as usize + dif.min().unwrap_or(0) as usize, 1).unwrap();
 
         // set out bitmap to the inverted one
         drop(alive);
@@ -234,7 +235,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tokenizing() -> Result<(), Box<dyn std::error::Error>> {
+    fn tokenizing_two() -> Result<(), Box<dyn std::error::Error>> {
         make_guard!(guard);
         let (mut arena, state): (Arena<'_, 1024>, _) = Arena::new(guard);
         let mut a = arena.allocate::<u8>(&state)?;
@@ -377,6 +378,19 @@ mod tests {
         let a = Box::leak(Box::new(tok_a));
         arena.finish(compact, state);
         //assert_eq!(*(a(&arena)), [0x1,0x2]);
+        Ok(())
+    }
+
+    #[test]
+    fn arena_alignment() -> Result<(), Box<dyn std::error::Error>> {
+        make_guard!(guard);
+        let (mut arena, state): (Arena<'_, 1024>, _) = Arena::new(guard);
+        let mut first = arena.allocate::<u8>(&state)?;
+        *first = 0xCC;
+        let mut a = arena.allocate::<u32>(&state)?;
+        let mut b = arena.allocate::<u8>(&state)?;
+        let mut c = arena.allocate::<u16>(&state)?;
+
         Ok(())
     }
 }
