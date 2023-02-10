@@ -1,4 +1,4 @@
-#![feature(unboxed_closures, fn_traits, inline_const, ptr_sub_ptr, generic_const_exprs)]
+#![feature(unboxed_closures, fn_traits, inline_const, generic_const_exprs)]
 use generativity::{make_guard, Guard, Id};
 use roaring::{RoaringBitmap};
 use core::sync::atomic::{Ordering, AtomicUsize};
@@ -23,19 +23,19 @@ pub struct Arena<'life> {
     _token: PhantomData<Id<'life>>,
 }
 
-impl<'life> Drop for Arena<'life> {
-    fn drop(&mut self) {
-        let Arena { current, ref bytes, bitmap, _token } = self;
-        unsafe {
-            let bytes = Box::from_raw(*bytes);
-            drop(bytes);
-        }
-        drop(current);
-        drop(bitmap);
-        drop(_token);
-        core::mem::forget(self);
-    }
-}
+//impl<'life> Drop for Arena<'life> {
+//    fn drop(&mut self) {
+//        let Arena { current, ref bytes, bitmap, _token } = self;
+//        unsafe {
+//            let bytes = Box::from_raw(*bytes);
+//            drop(bytes);
+//        }
+//        drop(current);
+//        drop(bitmap);
+//        drop(_token);
+//        core::mem::forget(self);
+//    }
+//}
 
 #[repr(transparent)]
 pub struct Item<'life, T> {
@@ -46,10 +46,11 @@ pub struct Item<'life, T> {
 #[repr(transparent)]
 pub struct Token<'life, 'borrow, 'compact, 'reborrow, T: Tokenize<'life, 'borrow, 'compact, 'reborrow>> where 'life: 'reborrow {
     //ptr: *mut <T as Tokenize>::Tokenized,
-    ptr: core::ptr::NonNull<T>,
+    ptr: core::ptr::NonNull<T::Tokenized<'borrow>>,
     _phantom: PhantomData<Id<'life>>,
     _compact: PhantomData<&'borrow Guard<'compact>>,
-    _result: PhantomData<&'reborrow mut T>,
+    //_result: PhantomData<&'reborrow T::Untokenized<'reborrow>>,
+    _result: PhantomData<&'reborrow ()>,
 }
 
 impl<'life, 'borrow, 'compact, 'reborrow, T: Tokenize<'life, 'borrow, 'compact, 'reborrow>> Drop for Token<'life, 'borrow, 'compact, 'reborrow, T> where 'compact: 'borrow {
@@ -63,11 +64,11 @@ impl<'life, 'borrow, 'compact, 'reborrow, T: Tokenize<'life, 'borrow, 'compact, 
     }
 }
 
-impl<'a, 'life, 'borrow, 'compact, T: Tokenize<'life, 'borrow, 'compact, 'a, Untokenized<'a> = T> + 'a> FnOnce<(&'a Arena<'life>,)>
+impl<'a, 'life, 'borrow, 'compact, T: Tokenize<'life, 'borrow, 'compact, 'a>> FnOnce<(&'a Arena<'life>,)>
     for Token<'life, 'borrow, 'compact, 'a, T>
-    where 'compact: 'borrow
+    where <T as Tokenize<'life, 'borrow, 'compact, 'a>>::Untokenized<'a>: 'a,
 {
-    type Output = Item<'life, &'a mut T>;
+    type Output = Item<'life, &'a mut T::Untokenized<'a>>;
 
     extern "rust-call" fn call_once(self, arena: (&'a Arena<'life>,)) -> Self::Output {
         // This token is being redeemed, meaning it's an alive object; we move the
@@ -90,7 +91,7 @@ impl<'a, 'life, 'borrow, 'compact, T: Tokenize<'life, 'borrow, 'compact, 'a, Unt
             // *increase* during a compaction
             let new_loc = loop {
                 let start: u32 = (arena.0.current.borrow().size() as usize - arena.0.bytes as *const u8 as usize).try_into().unwrap();
-                let new_loc = arena.0.reserve::<T>().unwrap();
+                let new_loc = arena.0.reserve::<T::Tokenized<'borrow>>().unwrap();
                 let end: u32 = (arena.0.current.borrow().size() as usize - arena.0.bytes as *const u8 as usize).try_into().unwrap();
                 // the bitmap is the available *holes*, not alive values, thanks
                 // to Arena::compact(). if we're able to clear the entire region,
@@ -108,13 +109,13 @@ impl<'a, 'life, 'borrow, 'compact, T: Tokenize<'life, 'borrow, 'compact, 'a, Unt
             }
         }
         let src: *mut T::Tokenized<'borrow> = unsafe { core::mem::transmute(data) };
-        let dst: *mut T = unsafe { core::mem::transmute(data) };
+        let dst: *mut T::Untokenized<'a> = unsafe { core::mem::transmute(data) };
         unsafe {
-            let new_val: T = <T as Tokenize<'life, 'borrow, 'compact, 'a>>::FROM(arena.0, src.read());
+            let new_val = <T as Tokenize<'life, 'borrow, 'compact, 'a>>::FROM(arena.0, src.read());
             dst.write(new_val);
         }
         core::mem::forget(self); // don't run destructor, which would free self.ptr
-        let dst: &'a mut T = unsafe { core::mem::transmute(dst) };
+        let dst: &'a mut T::Untokenized<'a> = unsafe { core::mem::transmute(dst) };
         Item { data: dst, _phantom: PhantomData }
     }
 }
@@ -185,15 +186,17 @@ impl<'life> Arena<'life> {
     /// This means that if you are compacting memory and create tokens for a set
     /// of objects, but only redeem half of them and drop the rest, the memory
     /// for the unredeemed half will not be reclaimed (until the next compaction set).
-    pub fn tokenize<'a, 'compact, 'borrow, 'reborrow, T: Tokenize<'life, 'borrow, 'compact, 'reborrow>>
-        (&self, guard: &'borrow Guard<'compact>, item: Item<'life, &'a mut T>)
+    pub fn tokenize<'before, 'compact, 'borrow, 'reborrow, T: Tokenize<'life, 'borrow, 'compact, 'reborrow>>
+        (&self, guard: &'borrow Guard<'compact>, item: Item<'life, &'before mut T>)
         -> Token<'life, 'borrow, 'compact, 'reborrow, T>
         where
             Equal<
                 { core::mem::size_of::<T>() },
-            { core::mem::size_of::<T::Tokenized<'compact>>() }>: True,
+            { core::mem::size_of::<T::Tokenized<'borrow>>() }>: True,
             'compact: 'borrow,
             'life: 'reborrow,
+            'life: 'compact,
+            'life: 'borrow,
     {
         // Mark the item's region as used
         let ptr = (item.data as *mut T as usize) - self.bytes as *const u8 as usize;
@@ -207,7 +210,7 @@ impl<'life> Arena<'life> {
             // Token's repr is the same as Item's repr), but no matter what it can't
             dst.write(<T as Tokenize<'life, 'borrow, 'compact, 'reborrow>>::TO(self, guard, src.read()));
         }
-        Token { ptr: core::ptr::NonNull::new(src).unwrap(), _phantom: PhantomData, _compact: PhantomData, _result: PhantomData }
+        Token { ptr: core::ptr::NonNull::new(dst).unwrap(), _phantom: PhantomData, _compact: PhantomData, _result: PhantomData }
     }
 
 
@@ -273,7 +276,12 @@ impl<'life> Arena<'life> {
 pub struct Compacting<'compact, 'life>(Id<'life>, PhantomData<Id<'compact>>);
 pub struct Allocating<'life>(Id<'life>);
 
-pub trait Tokenize<'life, 'borrow, 'compact, 'reborrow> where 'compact: 'borrow, 'life: 'reborrow {
+pub trait Tokenize<'life, 'borrow, 'compact, 'reborrow>
+    where 'compact: 'borrow,
+          'life: 'reborrow,
+          'life: 'borrow,
+          'life: 'compact,
+{
     type Tokenized<'borrow2> where 'borrow: 'borrow2;
     type Untokenized<'reborrow2> where 'reborrow: 'reborrow2;
     const TO: fn(&Arena<'life>, &'borrow Guard<'compact>, Self)
@@ -323,13 +331,25 @@ mod tests {
         #[derive(Default, Debug, Eq, PartialEq)]
         struct Bar(u8);
 
-        impl<'life, 'before, 'borrow, 'compact, 'reborrow> Tokenize<'life, 'borrow, 'compact, 'reborrow> for Foo<'life, 'before> where 'life: 'reborrow, 'compact: 'borrow, 'before: 'borrow, 'before: 'reborrow, 'borrow: 'reborrow, 'compact: 'reborrow {
+        impl<'life, 'before, 'borrow, 'compact, 'reborrow> Tokenize<'life, 'borrow, 'compact, 'reborrow>
+            for Foo<'life, 'before>
+            where 'compact: 'borrow,
+                  'life: 'reborrow,
+                  'life: 'borrow,
+                  'life: 'compact,
+        {
             type Tokenized<'borrow2> = TokenFoo<'life, 'borrow, 'compact, 'reborrow> where 'borrow: 'borrow2;
             type Untokenized<'reborrow2> = Foo<'life, 'reborrow> where 'reborrow: 'reborrow2;
             tokenize!(foo_to, foo_from);
         }
 
-        impl<'life, 'borrow, 'compact, 'reborrow> Tokenize<'life, 'borrow, 'compact, 'reborrow> for Bar where 'life: 'reborrow, 'compact: 'borrow {
+        impl<'life, 'borrow, 'compact, 'reborrow> Tokenize<'life, 'borrow, 'compact, 'reborrow>
+            for Bar
+            where 'compact: 'borrow,
+                  'life: 'reborrow,
+                  'life: 'borrow,
+                  'life: 'compact,
+        {
             type Tokenized<'borrow2> = Bar where 'borrow: 'borrow2;
             type Untokenized<'reborrow2> = Bar where 'reborrow: 'reborrow2;
             tokenize!(bar_to, bar_from);
@@ -348,9 +368,9 @@ mod tests {
             s
         }
 
-        fn foo_to<'life, 'borrow, 'compact, 'reborrow>
-            (arena: &Arena<'life>, guard: &'borrow Guard<'compact>, s: Foo<'life, 'borrow>)
-            -> TokenFoo<'life, 'borrow, 'compact, 'borrow>
+        fn foo_to<'life, 'borrow, 'compact, 'reborrow, 'before>
+            (arena: &'before Arena<'life>, guard: &'borrow Guard<'compact>, s: Foo<'life, 'before>)
+            -> TokenFoo<'life, 'borrow, 'compact, 'reborrow>
         {
             let Foo(bar) = s;
             TokenFoo(bar.map(|bar| arena.tokenize(guard, bar)))
@@ -364,20 +384,25 @@ mod tests {
 
         make_guard!(guard);
         let (mut arena, state): (Arena<'_>, _) = Arena::new(guard, 1024);
-        //let mut a: Item<'_, &mut Foo<'_, '_>> = arena.create(&state, || Foo(None))?;
         let mut a = arena.create(&state, || Bar(0))?;
+        let mut b: Item<'_, &mut Foo<'_, '_>> = arena.create(&state, || Foo(None))?;
         //let mut a2 = arena.allocate::<[Thing;12]>(&state)?;
         //assert_eq!(*a, Thing(0));
         //*a = Bar(1);
         //assert_eq!(a2[0], Thing(0));
         make_guard!(compact);
-        let a_tok = arena.tokenize(&compact, a);
+        let a_tok = arena.tokenize(&/* 'borrow */compact, b);
         let state = arena.compact(&compact, state);
-        let a = a_tok(&arena);
+        let a = a_tok(&/* 'reborrow */arena);
+        println!("{}", a.0.as_ref().unwrap().0);
+        drop(a);
+        //drop(a_tok);
         let state = arena.finish(compact, state);
-        println!("{}", a.0);
+        //println!("{}", a.0.as_ref().unwrap().0);
+        //drop(a);
         Ok(())
     }
+}
 
 //    #[test]
 //    fn tokenizing_vec() -> Result<(), Box<dyn std::error::Error>> {
@@ -582,4 +607,4 @@ mod tests {
 //
 //        Ok(())
 //    }
-}
+//}
