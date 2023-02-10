@@ -53,16 +53,16 @@ pub struct Token<'life, 'borrow, 'compact, 'reborrow, T: Tokenize<'life, 'borrow
     _result: PhantomData<&'reborrow ()>,
 }
 
-impl<'life, 'borrow, 'compact, 'reborrow, T: Tokenize<'life, 'borrow, 'compact, 'reborrow>> Drop for Token<'life, 'borrow, 'compact, 'reborrow, T> where 'compact: 'borrow {
-    fn drop<'a>(&'a mut self) {
-        // It's safe to just drop a Token. It will consume space via Arena bitmap,
-        // but only until the next compaction cycle. We can also run Drop for the
-        // item, due to COMPACT guaranteeing we are either being dropped before
-        // the guard goes out of scope, or are leaked (in which case Drop is never ran).
-        let data: &'a mut T::Tokenized<'borrow> = unsafe { core::mem::transmute(self.ptr) };
-        drop(data);
-    }
-}
+//impl<'life, 'borrow, 'compact, 'reborrow, T: Tokenize<'life, 'borrow, 'compact, 'reborrow>> Drop for Token<'life, 'borrow, 'compact, 'reborrow, T> where 'compact: 'borrow {
+//    fn drop<'a>(&'a mut self) {
+//        // It's safe to just drop a Token. It will consume space via Arena bitmap,
+//        // but only until the next compaction cycle. We can also run Drop for the
+//        // item, due to COMPACT guaranteeing we are either being dropped before
+//        // the guard goes out of scope, or are leaked (in which case Drop is never ran).
+//        let data: &'a mut T::Tokenized<'borrow> = unsafe { core::mem::transmute(self.ptr) };
+//        drop(data);
+//    }
+//}
 
 impl<'a, 'life, 'borrow, 'compact, T: Tokenize<'life, 'borrow, 'compact, 'a>> FnOnce<(&'a Arena<'life>,)>
     for Token<'life, 'borrow, 'compact, 'a, T>
@@ -120,13 +120,13 @@ impl<'a, 'life, 'borrow, 'compact, T: Tokenize<'life, 'borrow, 'compact, 'a>> Fn
     }
 }
 
-impl<'life, T: 'life> core::ops::Deref for Item<'life, &mut T> {
+impl<'life, T> core::ops::Deref for Item<'life, &mut T> {
     type Target = T;
     fn deref(&self) -> &Self::Target {
         &self.data
     }
 }
-impl<'life, T: 'life> core::ops::DerefMut for Item<'life, &mut T> {
+impl<'life, T> core::ops::DerefMut for Item<'life, &mut T> {
     fn deref_mut(&mut self) -> &mut <Self as core::ops::Deref>::Target {
         &mut self.data
     }
@@ -385,18 +385,12 @@ mod tests {
         make_guard!(guard);
         let (mut arena, state): (Arena<'_>, _) = Arena::new(guard, 1024);
         let mut a = arena.create(&state, || Bar(0))?;
-        let mut b: Item<'_, &mut Foo<'_, '_>> = arena.create(&state, || Foo(None))?;
-        //let mut a2 = arena.allocate::<[Thing;12]>(&state)?;
-        //assert_eq!(*a, Thing(0));
-        //*a = Bar(1);
-        //assert_eq!(a2[0], Thing(0));
+        let mut b: Item<'_, &mut Foo<'_, '_>> = arena.create(&state, || Foo(Some(a)))?;
         make_guard!(compact);
         let a_tok = arena.tokenize(&/* 'borrow */compact, b);
         let state = arena.compact(&compact, state);
         let a = a_tok(&/* 'reborrow */arena);
         println!("{}", a.0.as_ref().unwrap().0);
-        drop(a);
-        //drop(a_tok);
         let state = arena.finish(compact, state);
         //println!("{}", a.0.as_ref().unwrap().0);
         //drop(a);
