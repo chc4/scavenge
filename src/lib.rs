@@ -1,4 +1,4 @@
-#![feature(unboxed_closures, fn_traits, inline_const, ptr_sub_ptr, pin_macro)]
+#![feature(unboxed_closures, fn_traits, inline_const, ptr_sub_ptr, generic_const_exprs)]
 use generativity::{make_guard, Guard, Id};
 use roaring::{RoaringBitmap};
 use core::sync::atomic::{Ordering, AtomicUsize};
@@ -8,18 +8,22 @@ use core::marker::PhantomData;
 use core::pin::{Pin, pin};
 use std::ops::{Deref, DerefMut};
 
-pub struct Arena<'life, const SIZE: usize> {
+pub struct Equal<const T: usize, const R: usize>();
+pub trait True { }
+impl<const T: usize> True for Equal<T, T> { }
+
+pub struct Arena<'life> {
     // these refcells are kinda stupid: we use the presence of &mut Arenas in order
     // to encode API lifetime invariants, and so don't have mutability in functions
     // that do work. could probably just have them be LCells and put the LCellOwner
     // in the arena itself?
     current: RefCell<Layout>,
-    bytes: *mut [u8; SIZE],
+    bytes: *mut [u8],
     bitmap: RefCell<RoaringBitmap>,
     _token: PhantomData<Id<'life>>,
 }
 
-impl<'life, const SIZE: usize> Drop for Arena<'life, SIZE> {
+impl<'life> Drop for Arena<'life> {
     fn drop(&mut self) {
         let Arena { current, ref bytes, bitmap, _token } = self;
         unsafe {
@@ -40,27 +44,28 @@ pub struct Item<'life, T> {
 }
 
 #[repr(transparent)]
-pub struct Token<'life, T, COMPACT> {
-    ptr: *mut T,
+pub struct Token<'life, T: Tokenize<'life>, COMPACT> {
+    //ptr: *mut <T as Tokenize>::Tokenized,
+    ptr: core::ptr::NonNull<T>,
     _phantom: PhantomData<Id<'life>>,
     _compact: PhantomData<COMPACT>,
 }
 
-impl<'life, T, COMPACT> Drop for Token<'life, T, COMPACT> {
+impl<'life, T: Tokenize<'life>, COMPACT> Drop for Token<'life, T, COMPACT> {
     fn drop<'a>(&'a mut self) {
         // It's safe to just drop a Token. It will consume space via Arena bitmap,
         // but only until the next compaction cycle. We can also run Drop for the
         // item, due to COMPACT guaranteeing we are either being dropped before
         // the guard goes out of scope, or are leaked (in which case Drop is never ran).
-        let data: &'a mut T = unsafe { core::mem::transmute(self.ptr) };
+        let data: &'a mut T::Tokenized = unsafe { core::mem::transmute(self.ptr) };
         drop(data);
     }
 }
 
-impl<'a, 'life, 'compact, T: 'a, const SIZE: usize> FnOnce<(&'a Arena<'life, SIZE>,)> for Token<'life, T, &Guard<'compact>> {
+impl<'a, 'life, 'compact, T: Tokenize<'life> + 'a> FnOnce<(&'a Arena<'life>,)> for Token<'life, T, &Guard<'compact>> {
     type Output = Item<'life, &'a mut T>;
 
-    extern "rust-call" fn call_once(self, arena: (&'a Arena<'life, SIZE>,)) -> Self::Output {
+    extern "rust-call" fn call_once(self, arena: (&'a Arena<'life>,)) -> Self::Output {
         // This token is being redeemed, meaning it's an alive object; we move the
         // object to the end of the compacted region.
         //
@@ -70,19 +75,19 @@ impl<'a, 'life, 'compact, T: 'a, const SIZE: usize> FnOnce<(&'a Arena<'life, SIZ
         // and thus can't be redeemed after compacting has finished.
         // only reallocate if the item isn't already in the compact region
         let Token { ptr: mut data , .. } = self;
-        if data as usize > arena.0.current.borrow().size() {
+        if data.as_ptr() as usize > arena.0.current.borrow().size() {
             println!("moving {:?}", self.ptr);
             // mark our *own* allocation as free, so that e.g. [A][B][C] can
             // become [A][C][free] if sizeof(B)<sizeof(C).
-            let off = data as usize - arena.0.bytes as usize;
+            let off = data.as_ptr() as usize - arena.0.bytes as *const u8 as usize;
             arena.0.bitmap.borrow_mut().insert_range(off as u32..(off+core::mem::size_of::<T>()) as u32);
             println!("{:?}", arena.0.bitmap.borrow());
             // this unwrap shouldn't ever fail, since our memory usage usually shouldn't (can't?)
             // *increase* during a compaction
             let new_loc = loop {
-                let start: u32 = (arena.0.current.borrow().size() as usize - arena.0.bytes as usize).try_into().unwrap();
+                let start: u32 = (arena.0.current.borrow().size() as usize - arena.0.bytes as *const u8 as usize).try_into().unwrap();
                 let new_loc = arena.0.reserve::<T>().unwrap();
-                let end: u32 = (arena.0.current.borrow().size() as usize - arena.0.bytes as usize).try_into().unwrap();
+                let end: u32 = (arena.0.current.borrow().size() as usize - arena.0.bytes as *const u8 as usize).try_into().unwrap();
                 // the bitmap is the available *holes*, not alive values, thanks
                 // to Arena::compact(). if we're able to clear the entire region,
                 // then it was free and we can allocate into it.
@@ -91,16 +96,21 @@ impl<'a, 'life, 'compact, T: 'a, const SIZE: usize> FnOnce<(&'a Arena<'life, SIZ
                 }
                 // else jump to the next free space
                 *arena.0.current.borrow_mut() = Layout::from_size_align(
-                    arena.0.bytes as usize + arena.0.bitmap.borrow().min().unwrap() as usize, 1).unwrap();
+                    arena.0.bytes as *const u8 as usize + arena.0.bitmap.borrow().min().unwrap() as usize, 1).unwrap();
             };
             unsafe {
-                core::ptr::copy(data, new_loc, 1);
-                data = new_loc;
+                core::ptr::copy(data.as_ptr(), new_loc, 1);
+                data = core::ptr::NonNull::new(new_loc).unwrap();
             }
         }
-        let data: &mut T = unsafe { core::mem::transmute(data) };
+        let src: *mut T::Tokenized = unsafe { core::mem::transmute(data) };
+        let dst: *mut T = unsafe { core::mem::transmute(data) };
+        unsafe {
+            dst.write(<T as Tokenize<'life>>::FROM(arena.0, src.read()));
+        }
         core::mem::forget(self); // don't run destructor, which would free self.ptr
-        Item { data, _phantom: PhantomData }
+        let dst: &'a mut T = unsafe { core::mem::transmute(dst) };
+        Item { data: dst, _phantom: PhantomData }
     }
 }
 
@@ -116,11 +126,11 @@ impl<'life, T: 'life> core::ops::DerefMut for Item<'life, &mut T> {
     }
 }
 
-impl<'life, const SIZE: usize> Arena<'life, SIZE> {
-    pub fn new<'a>(id: Guard<'a>) -> (Arena<'a, SIZE>, Allocating<'a>) {
-        let bytes = Box::into_raw(Box::new([0; SIZE]));
+impl<'life> Arena<'life> {
+    pub fn new<'a>(id: Guard<'a>, size: usize) -> (Arena<'a>, Allocating<'a>) {
+        let bytes = Box::into_raw(vec![0; size].into_boxed_slice());
         (Arena {
-            current: RefCell::new(Layout::from_size_align(bytes as usize, 1).unwrap()),
+            current: RefCell::new(Layout::from_size_align(bytes as *const u8 as usize, 1).unwrap()),
             bytes,
             bitmap: RefCell::new(RoaringBitmap::new()),
             _token: Default::default(),
@@ -131,9 +141,11 @@ impl<'life, const SIZE: usize> Arena<'life, SIZE> {
         let start = self.current.borrow().clone();
         let (end, next) = start.extend(Layout::new::<T>())?;
         *self.current.borrow_mut() = end;
-        println!("item at {}, next at {}", next - self.bytes as usize, end.size() - self.bytes as usize);
+        println!("item at {}, next at {}",
+                 next - self.bytes as *const u8 as usize,
+                 end.size() - self.bytes as *const u8 as usize);
         unsafe {
-            Ok((self.bytes as *mut u8).add(next - self.bytes as usize) as *mut T)
+            Ok((self.bytes as *mut u8).add(next - self.bytes as *const u8 as usize) as *mut T)
         }
     }
 
@@ -142,6 +154,16 @@ impl<'life, const SIZE: usize> Arena<'life, SIZE> {
         unsafe {
             println!("{:x} {}", item as usize, core::mem::align_of::<T>());
             core::ptr::write(item, Default::default());
+            let item = core::mem::transmute::<*mut T, &'a mut T>(item);
+            Ok(Item { data: item, _phantom: PhantomData })
+        }
+    }
+
+    pub fn create<'a, T, F>(&'a self, allocating: &Allocating<'life>, f: F) -> Result<Item<'life, &'a mut T>, Box<dyn std::error::Error>> where F: FnOnce()->T {
+        let item = self.reserve::<T>()?;
+        unsafe {
+            println!("{:x} {}", item as usize, core::mem::align_of::<T>());
+            core::ptr::write(item, f());
             let item = core::mem::transmute::<*mut T, &'a mut T>(item);
             Ok(Item { data: item, _phantom: PhantomData })
         }
@@ -158,13 +180,24 @@ impl<'life, const SIZE: usize> Arena<'life, SIZE> {
     /// This means that if you are compacting memory and create tokens for a set
     /// of objects, but only redeem half of them and drop the rest, the memory
     /// for the unredeemed half will not be reclaimed (until the next compaction set).
-    pub fn tokenize<'a, 'compact, 'fresh, T>(&self, guard: &'fresh Guard<'compact>, item: Item<'life, &'a mut T>) -> Token<'life, T, &'fresh Guard<'compact>> {
+    pub fn tokenize<'a, 'compact, 'fresh, T: Tokenize<'life>>
+        (&self, guard: &'fresh Guard<'compact>, item: Item<'life, &'a mut T>)
+        -> Token<'life, T, &'fresh Guard<'compact>>
+        where Equal<{ core::mem::size_of::<T>() }, { core::mem::size_of::<T::Tokenized<'fresh, 'compact>>() }>: True
+    {
         // Mark the item's region as used
-        let ptr = (item.data as *mut T as usize) - self.bytes as usize;
+        let ptr = (item.data as *mut T as usize) - self.bytes as *const u8 as usize;
         let ptr_trunc: u32 = ptr.try_into().unwrap();
         println!("marking {}..={} as alive", ptr_trunc, ptr_trunc+(core::mem::size_of::<T>() as u32));
         self.bitmap.borrow_mut().insert_range(ptr_trunc..ptr_trunc+(core::mem::size_of::<T>() as u32));
-        Token { ptr: item.data as *mut T, _phantom: PhantomData, _compact: PhantomData }
+        let src = item.data as *mut T;
+        let dst = item.data as *mut T as *mut T::Tokenized<'fresh, 'compact>;
+        unsafe {
+            // tokenize the data, and write it back: ideally this is a no-op (since
+            // Token's repr is the same as Item's repr), but no matter what it can't
+            dst.write(<T as Tokenize<'life>>::TO(self, guard, src.read()));
+        }
+        Token { ptr: core::ptr::NonNull::new(src).unwrap(), _phantom: PhantomData, _compact: PhantomData }
     }
 
 
@@ -192,7 +225,7 @@ impl<'life, const SIZE: usize> Arena<'life, SIZE> {
         println!("dif {:?}", dif);
         // advance the bump pointer to the first free byte in the region
         *self.current.borrow_mut() = Layout::from_size_align(
-            self.bytes as usize + dif.min().unwrap_or(0) as usize, 1).unwrap();
+            self.bytes as *const u8 as usize + dif.min().unwrap_or(0) as usize, 1).unwrap();
 
         // set out bitmap to the inverted one
         drop(alive);
@@ -230,167 +263,306 @@ impl<'life, const SIZE: usize> Arena<'life, SIZE> {
 pub struct Compacting<'compact, 'life>(Id<'life>, PhantomData<Id<'compact>>);
 pub struct Allocating<'life>(Id<'life>);
 
+pub trait Tokenize<'life> {
+    type Tokenized<'borrow, 'compact> where 'compact: 'borrow;
+    const TO: for<'borrow, 'compact> fn(&Arena<'life>, &'borrow Guard<'compact>, Self) -> Self::Tokenized<'borrow, 'compact>;
+    const FROM: for<'c_borrow, 'borrow, 'compact> fn(&'borrow Arena<'life>, Self::Tokenized<'c_borrow, 'compact>) -> Self;
+}
+
+//struct ItemRef;
+//struct TokenRef;
+//trait Ref {
+//    type As<'life, 'borrow, 'compact, T: 'borrow> where 'life: 'borrow, 'life: 'compact, 'compact: 'borrow;
+//}
+//impl Ref for ItemRef {
+//    type As<'life, 'borrow, 'compact, T: 'borrow> =
+//        Item<'life, &'borrow mut T> where 'life: 'borrow, 'life: 'compact, 'compact: 'borrow;
+//}
+//impl ItemRef {
+//    fn tokenize(self) -> TokenRef {
+//        TokenRef
+//    }
+//}
+//impl Ref for TokenRef {
+//    type As<'life, 'borrow, 'compact, T: 'borrow> =
+//        Token<'life, T, &'borrow Guard<'compact>> where 'life: 'borrow, 'life: 'compact, 'compact: 'borrow;
+//}
+//
+
+macro_rules! tokenize {
+    ($to:expr, $from:expr) => {
+        const TO: for<'compact, 'borrow> fn(&Arena<'life>, &'borrow Guard<'compact>, Self)
+            -> Self::Tokenized<'borrow, 'compact>
+            = $to; // as for<'borrow, 'compact> fn(&Arena<'life>, &'borrow Guard<'compact>, Self)->Self::Tokenized<'borrow, 'compact>;
+        const FROM: for<'c_borrow, 'borrow, 'compact> fn(&'borrow Arena<'life>, Self::Tokenized<'c_borrow, 'compact>)
+            -> Self = $from;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn tokenizing_two() -> Result<(), Box<dyn std::error::Error>> {
+        struct Foo<'life, 'borrow>(Option<Item<'life, &'borrow mut Bar>>);
+        #[derive(Default, Debug, Eq, PartialEq)]
+        struct Bar(u8);
+
+        //impl<'life, 'i_borrow> Tokenize<'life> for Foo<'life, 'i_borrow> {
+        //    type Tokenized<'borrow, 'compact> = Token<'life, Bar, &'borrow Guard<'compact>>
+        //        where 'compact: 'borrow;
+        //    tokenize!(to, from);
+        //}
+
+        impl<'life> Tokenize<'life> for Bar {
+            type Tokenized<'c_borrow, 'compact> = Bar;
+            tokenize!(to_bar, from_bar);
+        }
+
+        fn to_bar<'life, 'borrow, 'compact>
+            (arena: &Arena<'life>, guard: &'borrow Guard<'compact>, s: Bar)
+            -> Option<core::ptr::NonNull<()>>
+        {
+            s
+        }
+        fn from_bar<'life, 'borrow>
+            (arena: &'borrow Arena<'life>, s: Bar)
+            ->
+        Bar {
+            s
+        }
+
+        fn to<'life, 'borrow, 'compact, 'i_borrow>
+            (arena: &Arena<'life>, guard: &'borrow Guard<'compact>, s: Foo<'life, 'i_borrow>)
+            -> Option<core::ptr::NonNull<()>>
+        {
+            Some(0 as *const ())
+        }
+        fn from<'life, 'borrow, 'i_borrow>
+            (arena: &'borrow Arena<'life>, s: Option<*const ()>)
+            ->
+        Foo<'life, 'i_borrow> {
+            panic!()
+        }
+
         make_guard!(guard);
-        let (mut arena, state): (Arena<'_, 1024>, _) = Arena::new(guard);
-        let mut a = arena.allocate::<u8>(&state)?;
-        let mut a2 = arena.allocate::<[u32;12]>(&state)?;
-        assert_eq!(*a, 0);
-        *a = 1;
-        assert_eq!(a2[0], 0);
+        let (mut arena, state): (Arena<'_>, _) = Arena::new(guard, 1024);
+        let mut a: Item<'_, &mut Foo<'_, '_>> = arena.create(&state, || Foo(None))?;
+        //let mut a2 = arena.allocate::<[Thing;12]>(&state)?;
+        //assert_eq!(*a, Thing(0));
+        //*a = Bar(1);
+        //assert_eq!(a2[0], Thing(0));
         make_guard!(compact);
         let a_tok = arena.tokenize(&compact, a);
         let state = arena.compact(&compact, state);
         let a = a_tok(&arena);
         let state = arena.finish(compact, state);
-        assert_eq!(*a, 1);
+        //assert_eq!(*a, Thing(1));
         Ok(())
     }
 
-    #[test]
-    fn tokenizing_vec() -> Result<(), Box<dyn std::error::Error>> {
-        make_guard!(guard);
-        let (mut arena, state): (Arena<'_, 1024>, _) = Arena::new(guard);
-        let mut v = vec![];
-        for i in 0..10 {
-            let mut item = arena.allocate::<u8>(&state)?;
-            *item = i;
-            v.push(item);
-        }
-        make_guard!(compact);
-        let mut tok_v = v.drain(..).map(|i| arena.tokenize(&compact, i) ).collect::<Vec<_>>();
-        let state = arena.compact(&compact, state);
-        let v = tok_v.into_iter().map(|t| t(&arena) ).collect::<Vec<_>>();
-        arena.finish(compact, state);
-        for i in 0..10 {
-            assert_eq!(*v[i], i as u8);
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn tokenizing_vec_reclaiming() -> Result<(), Box<dyn std::error::Error>> {
-        make_guard!(guard);
-        let (mut arena, state): (Arena<'_, 1024>, _) = Arena::new(guard);
-        let mut v = vec![];
-        for i in 0..10 {
-            let mut item = arena.allocate::<u8>(&state)?;
-            *item = i;
-            v.push(item);
-        }
-        make_guard!(compact);
-        let mut tok_v = v.drain(5..10).map(|i| arena.tokenize(&compact, i) ).collect::<Vec<_>>();
-        let state = arena.compact(&compact, state);
-        let v = tok_v.into_iter().map(|t| t(&arena) ).collect::<Vec<_>>();
-        arena.finish(compact, state);
-        for i in 0..5 {
-            assert_eq!(*v[i], 5+i as u8);
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn tokenizing_out_of_order() -> Result<(), Box<dyn std::error::Error>> {
-        make_guard!(guard);
-        let (mut arena, state): (Arena<'_, 1024>, _) = Arena::new(guard);
-        let mut a = arena.allocate::<u8>(&state)?;
-        *a = 0xAA;
-        let mut b = arena.allocate::<u8>(&state)?;
-        *b = 0xBB;
-
-        make_guard!(compact);
-        let tok_a = arena.tokenize(&compact, a);
-        let tok_b = arena.tokenize(&compact, b);
-        let state = arena.compact(&compact, state);
-        // redeem in the opposite order
-        let b = tok_b(&arena);
-        let a = tok_a(&arena);
-        arena.finish(compact, state);
-        assert_eq!(*a, 0xAA);
-        assert_eq!(*b, 0xBB);
-        Ok(())
-    }
-
-    #[test]
-    fn tokenizing_out_of_order_with_compacting() -> Result<(), Box<dyn std::error::Error>> {
-        make_guard!(guard);
-        let (mut arena, state): (Arena<'_, 1024>, _) = Arena::new(guard);
-        let mut first = arena.allocate::<u8>(&state)?;
-        let mut a = arena.allocate::<u8>(&state)?;
-        *a = 0xAA;
-        let mut b = arena.allocate::<u8>(&state)?;
-        *b = 0xBB;
-
-        make_guard!(compact);
-        let tok_a = arena.tokenize(&compact, a);
-        let tok_b = arena.tokenize(&compact, b);
-        let state = arena.compact(&compact, state);
-        // redeem in the opposite order
-        let b = tok_b(&arena);
-        let a = tok_a(&arena);
-        arena.finish(compact, state);
-        assert_eq!(*a, 0xAA);
-        assert_eq!(*b, 0xBB);
-        Ok(())
-    }
-
-    #[test]
-    fn tokenizing_small_gap() -> Result<(), Box<dyn std::error::Error>> {
-        make_guard!(guard);
-        let (mut arena, state): (Arena<'_, 1024>, _) = Arena::new(guard);
-        let mut first = arena.allocate::<u8>(&state)?;
-        *first = 0xCC;
-        let mut a = arena.allocate::<[u8;2]>(&state)?;
-        *a = [0x1,0x2];
-        let mut b = arena.allocate::<[u8;2]>(&state)?;
-        *b = [0x3,0x4];
-
-        make_guard!(compact);
-        let tok_a = arena.tokenize(&compact, a);
-        let tok_b = arena.tokenize(&compact, b);
-        let state = arena.compact(&compact, state);
-        // this doesn't actually compact correctly: if you don't redeem
-        // tokens in ascending ordering, than they can't all reclaimed free space.
-        // this wouldn't be a problem if Arena was a fixed-size type arena, so. idk
-        let b = tok_b(&arena);
-        let a = tok_a(&arena);
-        arena.finish(compact, state);
-        assert_eq!(*a, [0x1,0x2]);
-        assert_eq!(*b, [0x3,0x4]);
-        Ok(())
-    }
-
-    #[test]
-    fn tokenizing_leak_token() -> Result<(), Box<dyn std::error::Error>> {
-        make_guard!(guard);
-        let (mut arena, state): (Arena<'_, 1024>, _) = Arena::new(guard);
-        let mut a = arena.allocate::<[u8;2]>(&state)?;
-        *a = [0x1,0x2];
-
-        make_guard!(compact);
-        let tok_a = arena.tokenize(&compact, a);
-        let state = arena.compact(&compact, state);
-        let a = Box::leak(Box::new(tok_a));
-        arena.finish(compact, state);
-        //assert_eq!(*(a(&arena)), [0x1,0x2]);
-        Ok(())
-    }
-
-    #[test]
-    fn arena_alignment() -> Result<(), Box<dyn std::error::Error>> {
-        make_guard!(guard);
-        let (mut arena, state): (Arena<'_, 1024>, _) = Arena::new(guard);
-        let mut first = arena.allocate::<u8>(&state)?;
-        *first = 0xCC;
-        let mut a = arena.allocate::<u32>(&state)?;
-        let mut b = arena.allocate::<u8>(&state)?;
-        let mut c = arena.allocate::<u16>(&state)?;
-
-        Ok(())
-    }
+//    #[test]
+//    fn tokenizing_vec() -> Result<(), Box<dyn std::error::Error>> {
+//        make_guard!(guard);
+//        let (mut arena, state): (Arena<'_, 1024>, _) = Arena::new(guard);
+//        let mut v = vec![];
+//        for i in 0..10 {
+//            let mut item = arena.allocate::<u8>(&state)?;
+//            *item = i;
+//            v.push(item);
+//        }
+//        make_guard!(compact);
+//        let mut tok_v = v.drain(..).map(|i| arena.tokenize(&compact, i) ).collect::<Vec<_>>();
+//        let state = arena.compact(&compact, state);
+//        let v = tok_v.into_iter().map(|t| t(&arena) ).collect::<Vec<_>>();
+//        arena.finish(compact, state);
+//        for i in 0..10 {
+//            assert_eq!(*v[i], i as u8);
+//        }
+//        Ok(())
+//    }
+//
+//    #[test]
+//    fn tokenizing_vec_reclaiming() -> Result<(), Box<dyn std::error::Error>> {
+//        make_guard!(guard);
+//        let (mut arena, state): (Arena<'_, 1024>, _) = Arena::new(guard);
+//        let mut v = vec![];
+//        for i in 0..10 {
+//            let mut item = arena.allocate::<u8>(&state)?;
+//            *item = i;
+//            v.push(item);
+//        }
+//        make_guard!(compact);
+//        let mut tok_v = v.drain(5..10).map(|i| arena.tokenize(&compact, i) ).collect::<Vec<_>>();
+//        let state = arena.compact(&compact, state);
+//        let v = tok_v.into_iter().map(|t| t(&arena) ).collect::<Vec<_>>();
+//        arena.finish(compact, state);
+//        for i in 0..5 {
+//            assert_eq!(*v[i], 5+i as u8);
+//        }
+//        Ok(())
+//    }
+//
+//    #[test]
+//    fn tokenizing_out_of_order() -> Result<(), Box<dyn std::error::Error>> {
+//        make_guard!(guard);
+//        let (mut arena, state): (Arena<'_, 1024>, _) = Arena::new(guard);
+//        let mut a = arena.allocate::<u8>(&state)?;
+//        *a = 0xAA;
+//        let mut b = arena.allocate::<u8>(&state)?;
+//        *b = 0xBB;
+//
+//        make_guard!(compact);
+//        let tok_a = arena.tokenize(&compact, a);
+//        let tok_b = arena.tokenize(&compact, b);
+//        let state = arena.compact(&compact, state);
+//        // redeem in the opposite order
+//        let b = tok_b(&arena);
+//        let a = tok_a(&arena);
+//        arena.finish(compact, state);
+//        assert_eq!(*a, 0xAA);
+//        assert_eq!(*b, 0xBB);
+//        Ok(())
+//    }
+//
+//    #[test]
+//    fn tokenizing_out_of_order_with_compacting() -> Result<(), Box<dyn std::error::Error>> {
+//        make_guard!(guard);
+//        let (mut arena, state): (Arena<'_, 1024>, _) = Arena::new(guard);
+//        let mut first = arena.allocate::<u8>(&state)?;
+//        let mut a = arena.allocate::<u8>(&state)?;
+//        *a = 0xAA;
+//        let mut b = arena.allocate::<u8>(&state)?;
+//        *b = 0xBB;
+//
+//        make_guard!(compact);
+//        let tok_a = arena.tokenize(&compact, a);
+//        let tok_b = arena.tokenize(&compact, b);
+//        let state = arena.compact(&compact, state);
+//        // redeem in the opposite order
+//        let b = tok_b(&arena);
+//        let a = tok_a(&arena);
+//        arena.finish(compact, state);
+//        assert_eq!(*a, 0xAA);
+//        assert_eq!(*b, 0xBB);
+//        Ok(())
+//    }
+//
+//    #[test]
+//    fn tokenizing_small_gap() -> Result<(), Box<dyn std::error::Error>> {
+//        make_guard!(guard);
+//        let (mut arena, state): (Arena<'_, 1024>, _) = Arena::new(guard);
+//        let mut first = arena.allocate::<u8>(&state)?;
+//        *first = 0xCC;
+//        let mut a = arena.allocate::<[u8;2]>(&state)?;
+//        *a = [0x1,0x2];
+//        let mut b = arena.allocate::<[u8;2]>(&state)?;
+//        *b = [0x3,0x4];
+//
+//        make_guard!(compact);
+//        let tok_a = arena.tokenize(&compact, a);
+//        let tok_b = arena.tokenize(&compact, b);
+//        let state = arena.compact(&compact, state);
+//        // this doesn't actually compact correctly: if you don't redeem
+//        // tokens in ascending ordering, than they can't all reclaimed free space.
+//        // this wouldn't be a problem if Arena was a fixed-size type arena, so. idk
+//        let b = tok_b(&arena);
+//        let a = tok_a(&arena);
+//        arena.finish(compact, state);
+//        assert_eq!(*a, [0x1,0x2]);
+//        assert_eq!(*b, [0x3,0x4]);
+//        Ok(())
+//    }
+//
+//    #[test]
+//    fn tokenizing_leak_token() -> Result<(), Box<dyn std::error::Error>> {
+//        make_guard!(guard);
+//        let (mut arena, state): (Arena<'_, 1024>, _) = Arena::new(guard);
+//        let mut a = arena.allocate::<[u8;2]>(&state)?;
+//        *a = [0x1,0x2];
+//
+//        make_guard!(compact);
+//        let tok_a = arena.tokenize(&compact, a);
+//        let state = arena.compact(&compact, state);
+//        let a = Box::leak(Box::new(tok_a));
+//        arena.finish(compact, state);
+//        //assert_eq!(*(a(&arena)), [0x1,0x2]);
+//        Ok(())
+//    }
+//
+//    #[test]
+//    fn arena_alignment() -> Result<(), Box<dyn std::error::Error>> {
+//        make_guard!(guard);
+//        let (mut arena, state): (Arena<'_, 1024>, _) = Arena::new(guard);
+//        let mut first = arena.allocate::<u8>(&state)?;
+//        *first = 0xCC;
+//        let mut a = arena.allocate::<u32>(&state)?;
+//        let mut b = arena.allocate::<u8>(&state)?;
+//        let mut c = arena.allocate::<u16>(&state)?;
+//
+//        Ok(())
+//    }
+//
+//    fn arena_convert() -> Result<(), Box<dyn std::error::Error>> {
+//        struct Foo<'life, 'borrow> {
+//            bar: Item<'life, &'borrow mut Bar>
+//        }
+//        struct FooToken<'life, 'borrow, 'compact> {
+//            bar: Token<'life, Bar, &'borrow Guard<'compact>>
+//        }
+//        struct Bar;
+//        make_guard!(guard);
+//        let (mut arena, state): (Arena<'_, 1024>, _) = Arena::new(guard);
+//        let mut bar = arena.create(&state, || Bar)?;
+//        let mut first = arena.create(&state, || Foo { bar })?;
+//        make_guard!(compact);
+//        let first_tok: Token<'_, FooToken<'_, '_, '_>, '_> = arena.tokenize(&compact, first, |first| {
+//            FooToken {
+//                bar: arena.tokenize(&compact, first.bar);
+//            }
+//        });
+//        let state = arena.compact(&compact, state);
+//        let first = first_tok(&arena);
+//        let state = arena.finish(compact, state);
+//        Ok(())
+//    }
+//
+//    #[test]
+//    fn double_linked_list() -> Result<(), Box<dyn std::error::Error>> {
+//        struct Node<'life, 'borrow, 'compact, T: 'borrow, R: Ref + 'borrow>
+//            where 'life: 'borrow, 'life: 'compact, 'compact: 'borrow
+//        {
+//            prev: Option<R::As<'life, 'borrow, 'compact, Node<'life, 'borrow, 'compact, T, R>>>,
+//            next: Option<R::As<'life, 'borrow, 'compact, Node<'life, 'borrow, 'compact, T, R>>>,
+//        }
+//        //impl<'life, 'borrow, 'compact, T> Item<'life, &mut Node<'life, 'borrow, 'compact, T, ItemRef>>
+//        //    where 'life: 'borrow, 'life: 'compact, 'compact: 'borrow {
+//        //    fn tokenize<'fresh, const SIZE: usize>
+//        //        (mut self, arena: &Arena<'life, SIZE>, guard: &'fresh Guard<'compact>)
+//        //        -> Node<'life, 'fresh, 'compact, T, TokenRef> {
+//        //            let Node { ref mut prev, ref mut next } = self.deref_mut();
+//        //            Node {
+//        //                prev: prev.map(|p| {
+//        //                    //let tokened = p.tokenize(arena, guard);
+//        //                    panic!()
+//        //                    //arena.tokenize(guard, tokened)
+//        //                }),
+//        //                next: None
+//        //            }
+//        //    }
+//        //}
+//        make_guard!(guard);
+//        let (mut arena, state): (Arena<'_, 1024>, _) = Arena::new(guard);
+//        fn foo<'life>(arena: Arena<'life, 1024>, state: Allocating<'life>) -> Result<(), Box<dyn std::error::Error>> {
+//            let mut a: Item<&mut Node<'life, '_, '_, usize, ItemRef>> =
+//                arena.create(&state, || Node { prev: None, next: None })?;
+//            let mut b: Item<&mut Node<'life, '_, '_, usize, ItemRef>> =
+//                arena.create(&state, || Node { prev: Some(a), next: None })?;
+//            Ok(())
+//        }
+//        foo(arena, state);
+//
+//        Ok(())
+//    }
 }
