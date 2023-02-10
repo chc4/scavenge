@@ -14,9 +14,23 @@ pub struct Arena<'life, const SIZE: usize> {
     // that do work. could probably just have them be LCells and put the LCellOwner
     // in the arena itself?
     current: RefCell<Layout>,
-    bytes: Box<[u8; SIZE]>,
+    bytes: *mut [u8; SIZE],
     bitmap: RefCell<RoaringBitmap>,
     _token: PhantomData<Id<'life>>,
+}
+
+impl<'life, const SIZE: usize> Drop for Arena<'life, SIZE> {
+    fn drop(&mut self) {
+        let Arena { current, ref bytes, bitmap, _token } = self;
+        unsafe {
+            let bytes = Box::from_raw(*bytes);
+            drop(bytes);
+        }
+        drop(current);
+        drop(bitmap);
+        drop(_token);
+        core::mem::forget(self);
+    }
 }
 
 #[repr(transparent)]
@@ -33,12 +47,12 @@ pub struct Token<'life, T, COMPACT> {
 }
 
 impl<'life, T, COMPACT> Drop for Token<'life, T, COMPACT> {
-    fn drop(&mut self) {
+    fn drop<'a>(&'a mut self) {
         // It's safe to just drop a Token. It will consume space via Arena bitmap,
         // but only until the next compaction cycle. We can also run Drop for the
         // item, due to COMPACT guaranteeing we are either being dropped before
         // the guard goes out of scope, or are leaked (in which case Drop is never ran).
-        let data: &mut T = unsafe { core::mem::transmute(self.ptr) };
+        let data: &'a mut T = unsafe { core::mem::transmute(self.ptr) };
         drop(data);
     }
 }
@@ -55,12 +69,12 @@ impl<'a, 'life, 'compact, T: 'a, const SIZE: usize> FnOnce<(&'a Arena<'life, SIZ
         // Likewise, the token has a borrow for a Guard lifetime for the compaction step,
         // and thus can't be redeemed after compacting has finished.
         // only reallocate if the item isn't already in the compact region
-        let mut data = self.ptr;
-        if data as usize > arena.0.bytes.as_ptr() as usize + arena.0.current.borrow().size() {
+        let Token { ptr: mut data , .. } = self;
+        if data as usize > arena.0.bytes as usize + arena.0.current.borrow().size() {
             println!("moving {:?}", self.ptr);
             // mark our *own* allocation as free, so that e.g. [A][B][C] can
             // become [A][C][free] if sizeof(B)<sizeof(C).
-            let off = data as usize - arena.0.bytes.as_ptr() as usize;
+            let off = data as usize - arena.0.bytes as usize;
             arena.0.bitmap.borrow_mut().insert_range(off as u32..(off+core::mem::size_of::<T>()) as u32);
             println!("{:?}", arena.0.bitmap.borrow());
             // this unwrap shouldn't ever fail, since our memory usage usually shouldn't (can't?)
@@ -85,6 +99,7 @@ impl<'a, 'life, 'compact, T: 'a, const SIZE: usize> FnOnce<(&'a Arena<'life, SIZ
             }
         }
         let data: &mut T = unsafe { core::mem::transmute(data) };
+        core::mem::forget(self); // don't run destructor, which would free self.ptr
         Item { data, _phantom: PhantomData }
     }
 }
@@ -105,7 +120,7 @@ impl<'life, const SIZE: usize> Arena<'life, SIZE> {
     pub fn new<'a>(id: Guard<'a>) -> (Arena<'a, SIZE>, Allocating<'a>) {
         (Arena {
             current: RefCell::new(Layout::from_size_align(0, 1).unwrap()),
-            bytes: Box::new([0; SIZE]),
+            bytes: Box::into_raw(Box::new([0; SIZE])),
             bitmap: RefCell::new(RoaringBitmap::new()),
             _token: Default::default(),
         }, Allocating(id.into()))
@@ -113,12 +128,13 @@ impl<'life, const SIZE: usize> Arena<'life, SIZE> {
 
     fn reserve<'a, T>(&'a self) -> Result<*mut T, Box<dyn std::error::Error>> {
         let start = self.current.borrow().clone();
-        let (end, next) = start.extend(Layout::new::<T>())?;
+        let new_start = start.align_to(core::mem::align_of::<T>())?;
+        let (end, next) = new_start.extend(Layout::new::<T>())?;
         let end = end.pad_to_align();
         *self.current.borrow_mut() = end;
         println!("item at {}, next at {}", next, end.size());
         unsafe {
-            Ok((self.bytes.as_ptr() as *mut u8).add(next) as *mut T)
+            Ok((self.bytes as *mut u8).add(next) as *mut T)
         }
     }
 
@@ -144,7 +160,7 @@ impl<'life, const SIZE: usize> Arena<'life, SIZE> {
     /// for the unredeemed half will not be reclaimed (until the next compaction set).
     pub fn tokenize<'a, 'compact, 'fresh, T>(&self, guard: &'fresh Guard<'compact>, item: Item<'life, &'a mut T>) -> Token<'life, T, &'fresh Guard<'compact>> {
         // Mark the item's region as used
-        let ptr = (item.data as *mut T as usize) - self.bytes.as_ptr() as usize;
+        let ptr = (item.data as *mut T as usize) - self.bytes as usize;
         let ptr_trunc: u32 = ptr.try_into().unwrap();
         println!("marking {}..={} as alive", ptr_trunc, ptr_trunc+(core::mem::size_of::<T>() as u32));
         self.bitmap.borrow_mut().insert_range(ptr_trunc..ptr_trunc+(core::mem::size_of::<T>() as u32));
