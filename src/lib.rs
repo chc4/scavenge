@@ -52,20 +52,19 @@ pub struct Token<'life, 'borrow, 'compact, 'reborrow, T>
     ptr: core::ptr::NonNull<T::Tokenized<'borrow>>,
     _phantom: PhantomData<Id<'life>>,
     _compact: PhantomData<&'borrow Guard<'compact>>,
-    //_result: PhantomData<&'reborrow T::Untokenized<'reborrow>>,
-    _result: PhantomData<&'reborrow ()>,
+    _result: PhantomData<&'reborrow T::Untokenized<'reborrow>>,
 }
 
-//impl<'life, 'borrow, 'compact, 'reborrow, T: Tokenize<'life, 'borrow, 'compact, 'reborrow>> Drop for Token<'life, 'borrow, 'compact, 'reborrow, T> where 'compact: 'borrow {
-//    fn drop<'a>(&'a mut self) {
-//        // It's safe to just drop a Token. It will consume space via Arena bitmap,
-//        // but only until the next compaction cycle. We can also run Drop for the
-//        // item, due to COMPACT guaranteeing we are either being dropped before
-//        // the guard goes out of scope, or are leaked (in which case Drop is never ran).
-//        let data: &'a mut T::Tokenized<'borrow> = unsafe { core::mem::transmute(self.ptr) };
-//        drop(data);
-//    }
-//}
+impl<'life, 'borrow, 'compact, 'reborrow, T: Tokenize<'life, 'borrow, 'compact, 'reborrow>> Drop for Token<'life, 'borrow, 'compact, 'reborrow, T> where 'compact: 'borrow {
+    fn drop<'a>(&'a mut self) {
+        // It's safe to just drop a Token. It will consume space via Arena bitmap,
+        // but only until the next compaction cycle. We can also run Drop for the
+        // item, due to COMPACT guaranteeing we are either being dropped before
+        // the guard goes out of scope, or are leaked (in which case Drop is never ran).
+        let data: &'a mut T::Tokenized<'borrow> = unsafe { core::mem::transmute(self.ptr) };
+        drop(data);
+    }
+}
 
 impl<'a, 'life, 'borrow, 'compact, T: Tokenize<'life, 'borrow, 'compact, 'a>> FnOnce<(&'a Arena<'life>,)>
     for Token<'life, 'borrow, 'compact, 'a, T>
