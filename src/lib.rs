@@ -23,19 +23,19 @@ pub struct Arena<'life> {
     _token: PhantomData<Id<'life>>,
 }
 
-//impl<'life> Drop for Arena<'life> {
-//    fn drop(&mut self) {
-//        let Arena { current, ref bytes, bitmap, _token } = self;
-//        unsafe {
-//            let bytes = Box::from_raw(*bytes);
-//            drop(bytes);
-//        }
-//        drop(current);
-//        drop(bitmap);
-//        drop(_token);
-//        core::mem::forget(self);
-//    }
-//}
+impl<'life> Drop for Arena<'life> {
+    fn drop(&mut self) {
+        let Arena { current, ref bytes, bitmap, _token } = self;
+        unsafe {
+            let bytes = Box::from_raw(*bytes);
+            drop(bytes);
+        }
+        drop(current);
+        drop(bitmap);
+        drop(_token);
+        core::mem::forget(self);
+    }
+}
 
 #[repr(transparent)]
 pub struct Item<'life, T> {
@@ -198,8 +198,12 @@ impl<'life> Arena<'life> {
             T::Untokenized<'reborrow>: Tokenize<'life, 'borrow, 'compact, 'reborrow>,
             Equal<{ core::mem::size_of::<T>() },
                 { core::mem::size_of::<T::Tokenized<'borrow>>() }>: True,
-            //Equal<{ core::mem::size_of::<T>() },
-            //    { core::mem::size_of::<T::Untokenized<'reborrow>>() }>: True,
+            Equal<{ core::mem::size_of::<U>() },
+                { core::mem::size_of::<U::Tokenized<'borrow>>() }>: True,
+            Equal<{ core::mem::size_of::<T>() as usize },
+                { core::mem::size_of::<U>() }>: True,
+            Equal<{ core::mem::size_of::<T::Tokenized<'borrow>>() as usize },
+                { core::mem::size_of::<U::Tokenized<'borrow>>() }>: True,
             'compact: 'borrow,
             'life: 'reborrow,
             'life: 'compact,
@@ -404,7 +408,8 @@ mod tests {
         make_guard!(compact);
         let b_tok = arena.tokenize(&/* 'borrow */compact, b);
         let state = arena.compact(&compact, state);
-        let b = b_tok(&/* 'reborrow */arena);
+        let mut b = b_tok(&/* 'reborrow */arena);
+        b.0.as_mut().unwrap().0 = 1;
         let state = arena.finish(compact, state);
         println!("{}", b.0.as_ref().unwrap().0);
         //println!("{}", a.0.as_ref().unwrap().0);
