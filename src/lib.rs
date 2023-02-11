@@ -36,9 +36,19 @@ impl<'life> Drop for Arena<'life> {
 }
 
 #[repr(transparent)]
-pub struct Item<'life, T> {
-    data: T,
+pub struct Item<'life, 'borrow, T> {
+    data: &'borrow mut T,
     _phantom: PhantomData<Id<'life>>,
+}
+
+impl<'life, 'borrow, T> Drop for Item<'life, 'borrow, T> {
+    fn drop<'a>(&'a mut self) {
+        let Item { data, .. } = self;
+        unsafe {
+            println!("dropping item {:x}", *data as *mut _ as usize);
+            core::ptr::drop_in_place(*data as *mut _);
+        }
+    }
 }
 
 #[repr(transparent)]
@@ -59,8 +69,10 @@ impl<'life, 'borrow, 'compact, 'reborrow, T: Tokenize<'life, 'borrow, 'compact, 
         // but only until the next compaction cycle. We can also run Drop for the
         // item, due to 'compact guaranteeing we are either being dropped before
         // the guard goes out of scope, or are leaked (in which case Drop is never ran).
-        let data: &'a mut T::Tokenized = unsafe { core::mem::transmute(self.ptr) };
-        drop(data);
+        unsafe {
+            println!("dropping token");
+            core::ptr::drop_in_place(self.ptr.as_ptr());
+        }
     }
 }
 
@@ -68,7 +80,7 @@ impl<'a, 'life, 'borrow, 'compact, T: Tokenize<'life, 'borrow, 'compact, 'a>> Fn
     for Token<'life, 'borrow, 'compact, 'a, T>
     where <T as Tokenize<'life, 'borrow, 'compact, 'a>>::Untokenized: 'a,
 {
-    type Output = Item<'life, &'a mut T::Untokenized>;
+    type Output = Item<'life, 'a, T::Untokenized>;
 
     extern "rust-call" fn call_once(self, arena: (&'a Arena<'life>,)) -> Self::Output {
         // This token is being redeemed, meaning it's an alive object; we move the
@@ -96,6 +108,8 @@ impl<'a, 'life, 'borrow, 'compact, T: Tokenize<'life, 'borrow, 'compact, 'a>> Fn
                 // the bitmap is the available *holes*, not alive values, thanks
                 // to Arena::compact(). if we're able to clear the entire region,
                 // then it was free and we can allocate into it.
+                // This means that if we get a hole that we can't fit in, no later
+                // redeeming can fit in it either. Not great, but also fairly minor
                 if arena.0.bitmap.borrow_mut().remove_range(start..end) == (start..end).len() as u64 {
                     break new_loc
                 }
@@ -120,13 +134,13 @@ impl<'a, 'life, 'borrow, 'compact, T: Tokenize<'life, 'borrow, 'compact, 'a>> Fn
     }
 }
 
-impl<'life, T> core::ops::Deref for Item<'life, &mut T> {
+impl<'life, 'borrow, T> core::ops::Deref for Item<'life, 'borrow, T> {
     type Target = T;
     fn deref(&self) -> &Self::Target {
         &self.data
     }
 }
-impl<'life, T> core::ops::DerefMut for Item<'life, &mut T> {
+impl<'life, 'borrow, T> core::ops::DerefMut for Item<'life, 'borrow, T> {
     fn deref_mut(&mut self) -> &mut <Self as core::ops::Deref>::Target {
         &mut self.data
     }
@@ -155,7 +169,7 @@ impl<'life> Arena<'life> {
         }
     }
 
-    pub fn allocate<'a, T: Default>(&'a self, allocating: &Allocating<'life>) -> Result<Item<'life, &'a mut T>, Box<dyn std::error::Error>> {
+    pub fn allocate<'a, T: Default>(&'a self, allocating: &Allocating<'life>) -> Result<Item<'life, 'a, T>, Box<dyn std::error::Error>> {
         let item = self.reserve::<T>()?;
         unsafe {
             println!("{:x} {}", item as usize, core::mem::align_of::<T>());
@@ -165,7 +179,7 @@ impl<'life> Arena<'life> {
         }
     }
 
-    pub fn create<'a, T, F>(&'a self, allocating: &Allocating<'life>, f: F) -> Result<Item<'life, &'a mut T>, Box<dyn std::error::Error>> where F: FnOnce()->T {
+    pub fn create<'a, T, F>(&'a self, allocating: &Allocating<'life>, f: F) -> Result<Item<'life, 'a, T>, Box<dyn std::error::Error>> where F: FnOnce()->T {
         let item = self.reserve::<T>()?;
         unsafe {
             println!("{:x} {}", item as usize, core::mem::align_of::<T>());
@@ -175,7 +189,7 @@ impl<'life> Arena<'life> {
         }
     }
 
-    const fn same_repr<T, U>() -> bool {
+    pub const fn same_repr<T, U>() -> bool {
         let t = Layout::new::<T>();
         let u = Layout::new::<U>();
         t.size() == u.size() && t.align() == u.align()
@@ -193,7 +207,7 @@ impl<'life> Arena<'life> {
     /// of objects, but only redeem half of them and drop the rest, the memory
     /// for the unredeemed half will not be reclaimed (until the next compaction set).
     pub fn tokenize<'before, 'compact, 'borrow, 'reborrow, T, U>
-        (&self, guard: &'borrow Guard<'compact>, item: Item<'life, &'before mut T>)
+        (&self, guard: &'borrow Guard<'compact>, item: Item<'life, 'before, T>)
         -> Token<'life, 'borrow, 'compact, 'reborrow, U>
         where
             // we need to return a seperate type U as the Token result, so that
@@ -216,8 +230,11 @@ impl<'life> Arena<'life> {
         let ptr_trunc: u32 = ptr.try_into().unwrap();
         println!("marking {}..={} as alive", ptr_trunc, ptr_trunc+(core::mem::size_of::<T>() as u32));
         self.bitmap.borrow_mut().insert_range(ptr_trunc..ptr_trunc+(core::mem::size_of::<T>() as u32));
-        let src = item.data as *mut T;
-        let dst = item.data as *mut T as *mut T::Tokenized;
+
+        let mut item = std::mem::ManuallyDrop::new(item);
+
+        let src = item.data as &mut T as *mut T;
+        let dst = src as *mut T::Tokenized;
         unsafe {
             // tokenize the data, and write it back: ideally this is a no-op (since
             // Token's repr is the same as Item's repr), but no matter what it can't
@@ -341,7 +358,7 @@ mod tests {
     fn tokenizing_two() -> Result<(), Box<dyn std::error::Error>> {
         //struct Foo2<'life, 'borrow, 'compact, 'reborrow, Ref>(
         //    Option<Ref<'life, 'borrow, 'compact, 'reborrow, Bar>>);
-        struct Foo<'life, 'borrow>(Option<Item<'life, &'borrow mut Bar>>);
+        struct Foo<'life, 'borrow>(Option<Item<'life, 'borrow, Bar>>);
         struct TokenFoo<'life, 'borrow, 'compact, 'reborrow>(Option<Token<'life, 'borrow, 'compact, 'reborrow, Bar>>);
         #[derive(Default, Debug, Eq, PartialEq)]
         struct Bar(u8);
@@ -400,20 +417,22 @@ mod tests {
         make_guard!(guard);
         let (mut arena, state): (Arena<'_>, _) = Arena::new(guard, 1024);
         fn make<'life, 'before>(arena: &'before Arena<'life>, state: &Allocating<'life>)
-            -> Result<Item<'life, &'before mut Foo<'life, 'before>>, Box<dyn std::error::Error>>
+            -> Result<Item<'life, 'before, Foo<'life, 'before>>, Box<dyn std::error::Error>>
         {
-            let a: Item<'life, &'before mut Bar> = arena.create(&state, || Bar(0))?;
-            let b: Item<'life, &mut Foo<'life, 'before>> = arena.create(&state, || Foo(Some(a)))?;
+            let a: Item<'life, 'before, Bar> = arena.create(&state, || Bar(0))?;
+            let b: Item<'life, 'before, Foo<'life, 'before>> = arena.create(&state, || Foo(Some(a)))?;
             Ok(b)
         }
         let b = make(&/* 'before */arena, &state)?;
+        let c = arena.create(&state, || Box::new(128));
+        drop(c);
         make_guard!(compact);
         let b_tok = arena.tokenize(&/* 'borrow */compact, b);
         let state = arena.compact(&compact, state);
         let mut b = b_tok(&/* 'reborrow */arena);
+        let state = arena.finish(compact, state);
         b.0.as_mut().unwrap().0 = 1;
         drop(b);
-        let state = arena.finish(compact, state);
         //println!("{}", b.0.as_ref().unwrap().0);
         //println!("{}", a.0.as_ref().unwrap().0);
         //drop(a);
