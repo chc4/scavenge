@@ -7,10 +7,11 @@ use core::cell::RefCell;
 use core::marker::PhantomData;
 use core::pin::{Pin, pin};
 use std::ops::{Deref, DerefMut};
+use core::any::TypeId;
 
-pub struct Equal<const T: usize, const R: usize>();
+pub struct Bool<const T: bool>();
 pub trait True { }
-impl<const T: usize> True for Equal<T, T> { }
+impl True for Bool<true> { }
 
 pub struct Arena<'life> {
     // these refcells are kinda stupid: we use the presence of &mut Arenas in order
@@ -177,6 +178,12 @@ impl<'life> Arena<'life> {
         }
     }
 
+    const fn same_repr<T, U>() -> bool {
+        let t = Layout::new::<T>();
+        let u = Layout::new::<U>();
+        t.size() == u.size() && t.align() == u.align()
+    }
+
     /// Tokenize an allocated item into a forwarding pointer, which removes the
     /// tie to the Arena lifetime until redeemed again.
     ///
@@ -192,17 +199,15 @@ impl<'life> Arena<'life> {
         (&self, guard: &'borrow Guard<'compact>, item: Item<'life, &'before mut T>)
         -> Token<'life, 'borrow, 'compact, 'reborrow, U>
         where
-            // input type, like Foo<'life, 'before>
+            // we need to return a seperate type U as the Token result, so that
+            // we can re-parameterize the type over the 'reborrow lifetime
             T: Tokenize<'life, 'borrow, 'compact, 'reborrow, Untokenized<'reborrow> = U>,
             T::Untokenized<'reborrow>: Tokenize<'life, 'borrow, 'compact, 'reborrow>,
-            Equal<{ core::mem::size_of::<T>() },
-                { core::mem::size_of::<T::Tokenized<'borrow>>() }>: True,
-            Equal<{ core::mem::size_of::<U>() },
-                { core::mem::size_of::<U::Tokenized<'borrow>>() }>: True,
-            Equal<{ core::mem::size_of::<T>() as usize },
-                { core::mem::size_of::<U>() }>: True,
-            Equal<{ core::mem::size_of::<T::Tokenized<'borrow>>() as usize },
-                { core::mem::size_of::<U::Tokenized<'borrow>>() }>: True,
+            // make sure the tokenized and result fit in the same allocated space
+            // as the input, to guard against incorrect Tokenized impls
+            Bool<{ Self::same_repr::<T, T::Tokenized<'borrow>>() }>: True,
+            Bool<{ Self::same_repr::<T, U>() }>: True,
+            Bool<{ Self::same_repr::<T, U::Tokenized<'borrow>>() }>: True,
             'compact: 'borrow,
             'life: 'reborrow,
             'life: 'compact,
