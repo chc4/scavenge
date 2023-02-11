@@ -44,7 +44,10 @@ pub struct Item<'life, T> {
 }
 
 #[repr(transparent)]
-pub struct Token<'life, 'borrow, 'compact, 'reborrow, T: Tokenize<'life, 'borrow, 'compact, 'reborrow>> where 'life: 'reborrow {
+pub struct Token<'life, 'borrow, 'compact, 'reborrow, T>
+    where 'life: 'reborrow,
+          T: Tokenize<'life, 'borrow, 'compact, 'reborrow>
+{
     //ptr: *mut <T as Tokenize>::Tokenized,
     ptr: core::ptr::NonNull<T::Tokenized<'borrow>>,
     _phantom: PhantomData<Id<'life>>,
@@ -186,17 +189,22 @@ impl<'life> Arena<'life> {
     /// This means that if you are compacting memory and create tokens for a set
     /// of objects, but only redeem half of them and drop the rest, the memory
     /// for the unredeemed half will not be reclaimed (until the next compaction set).
-    pub fn tokenize<'before, 'compact, 'borrow, 'reborrow, T: Tokenize<'life, 'borrow, 'compact, 'reborrow>>
+    pub fn tokenize<'before, 'compact, 'borrow, 'reborrow, T, U>
         (&self, guard: &'borrow Guard<'compact>, item: Item<'life, &'before mut T>)
-        -> Token<'life, 'borrow, 'compact, 'reborrow, T>
+        -> Token<'life, 'borrow, 'compact, 'reborrow, U>
         where
-            Equal<
-                { core::mem::size_of::<T>() },
-            { core::mem::size_of::<T::Tokenized<'borrow>>() }>: True,
+            // input type, like Foo<'life, 'before>
+            T: Tokenize<'life, 'borrow, 'compact, 'reborrow, Untokenized<'reborrow> = U>,
+            T::Untokenized<'reborrow>: Tokenize<'life, 'borrow, 'compact, 'reborrow>,
+            Equal<{ core::mem::size_of::<T>() },
+                { core::mem::size_of::<T::Tokenized<'borrow>>() }>: True,
+            //Equal<{ core::mem::size_of::<T>() },
+            //    { core::mem::size_of::<T::Untokenized<'reborrow>>() }>: True,
             'compact: 'borrow,
             'life: 'reborrow,
             'life: 'compact,
             'life: 'borrow,
+            // 'borrow: 'before ??
     {
         // Mark the item's region as used
         let ptr = (item.data as *mut T as usize) - self.bytes as *const u8 as usize;
@@ -210,7 +218,7 @@ impl<'life> Arena<'life> {
             // Token's repr is the same as Item's repr), but no matter what it can't
             dst.write(<T as Tokenize<'life, 'borrow, 'compact, 'reborrow>>::TO(self, guard, src.read()));
         }
-        Token { ptr: core::ptr::NonNull::new(dst).unwrap(), _phantom: PhantomData, _compact: PhantomData, _result: PhantomData }
+        Token { ptr: core::ptr::NonNull::new(dst as *mut _).unwrap(), _phantom: PhantomData, _compact: PhantomData, _result: PhantomData }
     }
 
 
@@ -379,19 +387,26 @@ mod tests {
             (arena: &'reborrow Arena<'life>, s: TokenFoo<'life, 'borrow, 'compact, 'reborrow>)
             ->
         Foo<'life, 'reborrow> {
-            panic!()
+            Foo(s.0.map(|bar| bar.call_once((arena,))))
         }
 
         make_guard!(guard);
         let (mut arena, state): (Arena<'_>, _) = Arena::new(guard, 1024);
-        let mut a = arena.create(&state, || Bar(0))?;
-        let mut b: Item<'_, &mut Foo<'_, '_>> = arena.create(&state, || Foo(Some(a)))?;
+        fn make<'life, 'before>(arena: &'before Arena<'life>, state: &Allocating<'life>)
+            // PROBLEM IS FOO STILL MENTIONS 'before
+            -> Result<Item<'life, &'before mut Foo<'life, 'before>>, Box<dyn std::error::Error>>
+        {
+            let a: Item<'life, &'before mut Bar> = arena.create(&state, || Bar(0))?;
+            let b: Item<'life, &mut Foo<'life, 'before>> = arena.create(&state, || Foo(Some(a)))?;
+            Ok(b)
+        }
+        let b = make(&/* 'before */arena, &state)?;
         make_guard!(compact);
-        let a_tok = arena.tokenize(&/* 'borrow */compact, b);
+        let b_tok = arena.tokenize(&/* 'borrow */compact, b);
         let state = arena.compact(&compact, state);
-        let a = a_tok(&/* 'reborrow */arena);
-        println!("{}", a.0.as_ref().unwrap().0);
+        let b = b_tok(&/* 'reborrow */arena);
         let state = arena.finish(compact, state);
+        println!("{}", b.0.as_ref().unwrap().0);
         //println!("{}", a.0.as_ref().unwrap().0);
         //drop(a);
         Ok(())
