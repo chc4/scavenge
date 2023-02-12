@@ -31,7 +31,7 @@ Compacting region allocator in Rust that uses lifetimes in order to guarantee th
     assert_eq!(*b, 0xBB);
 ```
 
-#Downsides:
+# Downsides:
 
 I mean. There's a few. You have to destructure any collections that are keeping around Item references in order to convert them to Tokens, because it's a compile-time type-level check - the Item and Token reprs should be the same, but Rust probably isn't very smart about knowing that round-tripping a Vec::into_iter through the conversions can be optimized.
 
@@ -39,4 +39,4 @@ The Arena is a variable sized allocator, and so you can allocate whatever data y
 
 I had the idea of being able to convert an `Item<WithHeader<T>>` into a `Pin<Box<Forward<T>>>` pointer, which would be automatically fixed-up by the compactor (with the allocation being able to keep the Box's pointer address to fixup inline with the item header, since it is immovable), so that you could automatically(tm) update the forwarding pointers after compaction without having to tear-down and rebuild datastructures (at the cost of deref being two pointer chases instead). That scheme would probably be able to help a bit with compacting the region, since it would be able to fixup all the outstanding `Forward<T>` items in ascending order all at once, before all of the `Token<T>` items. I didn't implement that part yet, though.
 
-Also I don't actually have proof any of this is actually sound. Maybe I horribly misunderstand how lifetimes or `generativity` guards work.
+As written, it also only has *owned* references, not shared references...which kind of defeats the entire point of a garbage collector. I messed around with adding support for allocated items that can point to other items and proper shared references (see `hktb` branch), but the lifetimes and generic bounds quickly got unwieldy. Consider this a neat tech demo, but not a good idea.
