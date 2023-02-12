@@ -5,6 +5,9 @@ use std::alloc::Layout;
 use core::cell::RefCell;
 use core::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
+use std::collections::HashMap;
+
+//mod forward;
 
 pub struct Bool<const T: bool>();
 pub trait True { }
@@ -18,12 +21,13 @@ pub struct Arena<'life> {
     current: RefCell<Layout>,
     bytes: *mut [u8],
     bitmap: RefCell<RoaringBitmap>,
+    autoforward: RefCell<HashMap<*mut (), for<'compact> fn(&Arena<'life>, &Guard<'compact>, *mut ())->()>>,
     _token: PhantomData<Id<'life>>,
 }
 
 impl<'life> Drop for Arena<'life> {
     fn drop(&mut self) {
-        let Arena { current, ref bytes, bitmap, _token } = self;
+        let Arena { current, ref bytes, autoforward, bitmap, _token } = self;
         unsafe {
             let bytes = Box::from_raw(*bytes);
             drop(bytes);
@@ -31,7 +35,9 @@ impl<'life> Drop for Arena<'life> {
         drop(current);
         drop(bitmap);
         drop(_token);
-        core::mem::forget(self);
+        Box::new(1)
+            .max(Box::new(0));
+        //core::mem::forget(self);
     }
 }
 
@@ -152,6 +158,7 @@ impl<'life> Arena<'life> {
         (Arena {
             current: RefCell::new(Layout::from_size_align(bytes as *const u8 as usize, 1).unwrap()),
             bytes,
+            autoforward: RefCell::new(HashMap::new()),
             bitmap: RefCell::new(RoaringBitmap::new()),
             _token: Default::default(),
         }, Allocating(id.into()))
@@ -252,7 +259,9 @@ impl<'life> Arena<'life> {
     /// No outstanding Item<T> references can exist across this call; all alive
     /// references must be "tokenized" (or dropped) in order to mark them alive
     /// before this is called, or else you'll get confusing lifetime errors.
-    pub fn compact<'compact>(&mut self, guard: &Guard<'compact>, compact: Allocating<'life>) -> Compacting<'compact, 'life> {
+    pub fn compact<'compact>(&mut self, guard: &Guard<'compact>, compact: Allocating<'life>) -> Compacting<'compact, 'life>
+        where 'life: 'compact
+    {
         // now we've started compaction, and it's impossible to any more values to
         // tokenize themselves and mark themselves alive.
 
@@ -273,6 +282,13 @@ impl<'life> Arena<'life> {
         // set out bitmap to the inverted one
         drop(alive);
         *self.bitmap.borrow_mut() = dif;
+
+        // immediately compact all the autoforward items and update their pinned
+        // forward pointers
+        let autoforward = &*self.autoforward.borrow();
+        for forward in autoforward {
+            forward.1(&*self, guard, *forward.0);
+        }
 
         // we can't have Arena itself be a linear state transitioning type, and have
         // to use a seperate parameter. this is because although we could move self
